@@ -66,14 +66,33 @@ try await database.withTransaction { transaction in
 - Swift 6.1+
 - FoundationDB 7.1+
 - macOS 12+ / Linux
+- pkgconfig 
 
 ## Installation
+
+Add the following package config following `/opt/homebrew/lib/pkgconfig/libfdb.pc` for macOS.
+Adapt files directory and version of your current installation.
+
+```
+prefix=/usr/local
+exec_prefix=${prefix}
+includedir=${prefix}/include
+libdir=${exec_prefix}/lib
+
+Name: CFoundationDB
+Description: The foundationdb C library
+Version: 7.3.9
+Cflags: -I${includedir}
+Libs: -L${libdir} -lfdb_c
+```
+
+
 
 Add the package to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/apple/fdb-swift-bindings", from: "1.0.0")
+    .package(url: "https://github.com/FoundationDB/fdb-swift-bindings", branch: "main")
 ]
 ```
 
