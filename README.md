@@ -307,6 +307,16 @@ RecordType(User.self, key: 1, primaryKey: \.id)
     .index("email", on: \.email, key: 10, unique: true)
 ```
 
+### Indexing enum fields
+
+Protobuf scalar fields are indexable out of the box. A protobuf **enum** needs a one-line,
+zero-body conformance (the library supplies the implementation for any `RawRepresentable` whose
+`RawValue` is `Int`, which every proto enum is); the enum is then indexed by its raw value:
+
+```swift
+extension MyApp_DeviceType: IndexableValue {}
+```
+
 ### Paging
 
 Set a `limit` and page with an opaque continuation token (stateless — safe to hand to an API

@@ -9,6 +9,13 @@ message Customer {
   string city = 3;
 }
 
+// An enum, to exercise indexing on protobuf enum fields.
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  RED = 1;
+  BLUE = 2;
+}
+
 // The primary record type used across Record Layer tests.
 message Order {
   int64 order_id = 1;
@@ -16,6 +23,7 @@ message Order {
   int64 price = 3;
   Customer customer = 4;
   repeated string tags = 5;
+  Color color = 6;
 }
 
 // A second record type sharing the store, used for multi-type and aggregate tests.
