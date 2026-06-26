@@ -282,34 +282,45 @@ extension DatabaseProtocol {
     public func withTransaction<T: Sendable>(
         _ operation: (TransactionProtocol) async throws -> T
     ) async throws -> T {
-        let maxRetries = 100 // TODO: Remove this.
-
-        for attempt in 0 ..< maxRetries {
-            let transaction = try createTransaction()
-
-            do {
-                let result = try await operation(transaction)
-                let committed = try await transaction.commit()
-
-                if committed {
-                    return result
-                }
-            } catch {
-                // TODO: If user wants to cancel, don't retry.
-                transaction.cancel()
-
-                if let fdbError = error as? FDBError, fdbError.isRetryable {
-                    if attempt < maxRetries - 1 {
-                        continue
-                    }
-                }
-
-                throw error
-            }
-        }
-
-        throw FDBError(.transactionTooOld)
+        try await runTransaction(creating: { try createTransaction() }, operation)
     }
+}
+
+/// Runs `operation` in a transaction with automatic retry on retryable errors.
+///
+/// Shared by ``DatabaseProtocol/withTransaction(_:)`` and ``FDBTenant/withTransaction(_:)`` so
+/// database- and tenant-scoped transactions use identical retry semantics.
+func runTransaction<T: Sendable>(
+    creating createTransaction: () throws -> any TransactionProtocol,
+    _ operation: (TransactionProtocol) async throws -> T
+) async throws -> T {
+    let maxRetries = 100 // TODO: Remove this.
+
+    for attempt in 0 ..< maxRetries {
+        let transaction = try createTransaction()
+
+        do {
+            let result = try await operation(transaction)
+            let committed = try await transaction.commit()
+
+            if committed {
+                return result
+            }
+        } catch {
+            // TODO: If user wants to cancel, don't retry.
+            transaction.cancel()
+
+            if let fdbError = error as? FDBError, fdbError.isRetryable {
+                if attempt < maxRetries - 1 {
+                    continue
+                }
+            }
+
+            throw error
+        }
+    }
+
+    throw FDBError(.transactionTooOld)
 }
 
 extension TransactionProtocol {

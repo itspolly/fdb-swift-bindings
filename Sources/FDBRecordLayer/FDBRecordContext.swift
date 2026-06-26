@@ -76,4 +76,18 @@ extension DatabaseProtocol {
         }
     }
 }
+
+extension FDBTenant {
+    /// Runs `operation` inside a record context scoped to this tenant.
+    ///
+    /// A record store opened with the resulting context lives entirely within the tenant's key
+    /// space, so two tenants can host independent stores at the same subspace/primary keys.
+    public func withRecordContext<T: Sendable>(
+        _ operation: (FDBRecordContext) async throws -> T
+    ) async throws -> T {
+        try await withTransaction { transaction in
+            try await operation(FDBRecordContext(transaction: transaction))
+        }
+    }
+}
 #endif

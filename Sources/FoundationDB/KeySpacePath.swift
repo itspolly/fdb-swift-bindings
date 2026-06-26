@@ -18,8 +18,6 @@
  * limitations under the License.
  */
 
-#if RecordLayer
-import FoundationDB
 
 /// A logical, directory-style path that resolves to a ``Subspace``.
 ///
@@ -58,4 +56,3 @@ public struct KeySpacePath: Sendable, Hashable {
         Subspace(prefix: prefix)
     }
 }
-#endif

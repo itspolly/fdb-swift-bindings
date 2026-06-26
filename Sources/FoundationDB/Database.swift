@@ -70,6 +70,38 @@ public final class FDBDatabase: DatabaseProtocol, @unchecked Sendable {
         return FDBTransaction(transaction: tr)
     }
 
+    /// Opens an existing tenant by name for tenant-scoped transactions.
+    ///
+    /// The tenant must already exist (create it with ``createTenant(name:)``). Requires API
+    /// version ≥ 720.
+    ///
+    /// - Parameter name: The tenant's name.
+    /// - Returns: An ``FDBTenant`` handle.
+    /// - Throws: `FDBError` if the tenant cannot be opened.
+    public func openTenant(name: FDB.Bytes) throws -> FDBTenant {
+        var tenant: OpaquePointer?
+        let error = name.withUnsafeBytes { bytes in
+            fdb_database_open_tenant(
+                database,
+                bytes.bindMemory(to: UInt8.self).baseAddress,
+                Int32(name.count),
+                &tenant
+            )
+        }
+        if error != 0 {
+            throw FDBError(code: error)
+        }
+        guard let openedTenant = tenant else {
+            throw FDBError(.internalError)
+        }
+        return FDBTenant(tenant: openedTenant)
+    }
+
+    /// Opens an existing tenant by name string.
+    public func openTenant(name: String) throws -> FDBTenant {
+        try openTenant(name: Array(name.utf8))
+    }
+
     /// Sets a database option with a byte array value.
     ///
     /// - Parameters:

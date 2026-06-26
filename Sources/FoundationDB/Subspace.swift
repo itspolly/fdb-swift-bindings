@@ -18,8 +18,6 @@
  * limitations under the License.
  */
 
-#if RecordLayer
-import FoundationDB
 
 /// Errors raised while packing/unpacking keys against a ``Subspace``.
 public enum SubspaceError: Error, Sendable, Equatable {
@@ -111,4 +109,3 @@ public struct Subspace: Sendable, Hashable {
         return (p + [0x00], p + [0xFF])
     }
 }
-#endif

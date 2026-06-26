@@ -22,63 +22,67 @@
 import Foundation
 import SwiftProtobuf
 
-/// Resolves a top-level scalar field's protobuf field number from a writable key path.
+/// Resolves a (possibly nested) scalar field's protobuf field-number path from a writable key
+/// path.
 ///
 /// A fresh message is stamped with the type's ``IndexableValue/probeValue`` through the key
 /// path, then traversed: since every other field is still at its proto default (and thus not
-/// visited), the single visited scalar field reveals the number. Returns `nil` for nested or
-/// non-scalar key paths (no single top-level scalar is visited) — callers then fall back to
-/// key-path identity matching.
+/// visited), the single stamped field reveals the path. A nested key path stamps a sub-message
+/// field, so the traversal recurses into it and prepends the parent field number, yielding e.g.
+/// `[4, 2]` for `customer.name`. Returns `nil` if there isn't exactly one stamped leaf.
 ///
 /// This is what lets a `KeyPath` query select an index that was declared with proto
 /// annotations (which only know field numbers).
 enum FieldNumberResolver {
     static func resolve<M: SwiftProtobuf.Message, V: IndexableValue>(
         _ keyPath: WritableKeyPath<M, V>
-    ) -> Int? {
+    ) -> [Int]? {
         var message = M()
         message[keyPath: keyPath] = V.probeValue
-        return uniqueScalarFieldNumber(of: message)
+        return uniqueFieldPath(of: message)
     }
 
     static func resolve<M: SwiftProtobuf.Message, V: IndexableValue>(
         _ keyPath: WritableKeyPath<M, V?>
-    ) -> Int? {
+    ) -> [Int]? {
         var message = M()
         message[keyPath: keyPath] = V.probeValue
-        return uniqueScalarFieldNumber(of: message)
+        return uniqueFieldPath(of: message)
     }
 
     static func resolve<M: SwiftProtobuf.Message, V: IndexableValue>(
         _ keyPath: WritableKeyPath<M, [V]>
-    ) -> Int? {
+    ) -> [Int]? {
         var message = M()
         message[keyPath: keyPath] = [V.probeValue]
-        return uniqueScalarFieldNumber(of: message)
+        return uniqueFieldPath(of: message)
     }
 
-    private static func uniqueScalarFieldNumber(of message: any SwiftProtobuf.Message) -> Int? {
-        var visitor = SingleScalarFieldVisitor()
+    /// The single stamped field path within `message`, or `nil` if not exactly one.
+    static func uniqueFieldPath(of message: any SwiftProtobuf.Message) -> [Int]? {
+        var visitor = SingleFieldPathVisitor()
         try? message.traverse(visitor: &visitor)
-        return visitor.scalarFieldNumbers.count == 1 ? visitor.scalarFieldNumbers.first : nil
+        return visitor.paths.count == 1 ? visitor.paths.first : nil
     }
 }
 
-/// Records the field numbers of visited scalar fields (ignoring nested messages), so a message
-/// with exactly one non-default scalar field reveals that field's number.
-private struct SingleScalarFieldVisitor: SwiftProtobuf.Visitor {
-    var scalarFieldNumbers: [Int] = []
+/// Records the field-number path(s) of stamped fields. Scalar leaves record `[fieldNumber]`;
+/// a stamped sub-message recurses and records `[fieldNumber] + subPath`, so a message with
+/// exactly one stamped (non-default) field reveals its full path.
+private struct SingleFieldPathVisitor: SwiftProtobuf.Visitor {
+    var paths: [[Int]] = []
 
-    mutating func visitSingularDoubleField(value: Double, fieldNumber: Int) throws { scalarFieldNumbers.append(fieldNumber) }
-    mutating func visitSingularInt64Field(value: Int64, fieldNumber: Int) throws { scalarFieldNumbers.append(fieldNumber) }
-    mutating func visitSingularUInt64Field(value: UInt64, fieldNumber: Int) throws { scalarFieldNumbers.append(fieldNumber) }
-    mutating func visitSingularBoolField(value: Bool, fieldNumber: Int) throws { scalarFieldNumbers.append(fieldNumber) }
-    mutating func visitSingularStringField(value: String, fieldNumber: Int) throws { scalarFieldNumbers.append(fieldNumber) }
-    mutating func visitSingularBytesField(value: Data, fieldNumber: Int) throws { scalarFieldNumbers.append(fieldNumber) }
-    mutating func visitSingularEnumField<E: SwiftProtobuf.Enum>(value: E, fieldNumber: Int) throws { scalarFieldNumbers.append(fieldNumber) }
+    mutating func visitSingularDoubleField(value: Double, fieldNumber: Int) throws { paths.append([fieldNumber]) }
+    mutating func visitSingularInt64Field(value: Int64, fieldNumber: Int) throws { paths.append([fieldNumber]) }
+    mutating func visitSingularUInt64Field(value: UInt64, fieldNumber: Int) throws { paths.append([fieldNumber]) }
+    mutating func visitSingularBoolField(value: Bool, fieldNumber: Int) throws { paths.append([fieldNumber]) }
+    mutating func visitSingularStringField(value: String, fieldNumber: Int) throws { paths.append([fieldNumber]) }
+    mutating func visitSingularBytesField(value: Data, fieldNumber: Int) throws { paths.append([fieldNumber]) }
+    mutating func visitSingularEnumField<E: SwiftProtobuf.Enum>(value: E, fieldNumber: Int) throws { paths.append([fieldNumber]) }
     mutating func visitSingularMessageField<M: SwiftProtobuf.Message>(value: M, fieldNumber: Int) throws {
-        // Ignore nested messages: a nested key path stamps a sub-field, surfacing the message
-        // field here, which is not a usable top-level scalar identity.
+        if let subPath = FieldNumberResolver.uniqueFieldPath(of: value) {
+            paths.append([fieldNumber] + subPath)
+        }
     }
     mutating func visitMapField<KeyType, ValueType: SwiftProtobuf.MapValueType>(
         fieldType: SwiftProtobuf._ProtobufMap<KeyType, ValueType>.Type,

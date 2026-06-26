@@ -4,11 +4,17 @@ package fdb.test;
 
 import "record_metadata_options.proto";
 
+// A nested message with an annotated (indexed) field, to exercise nested annotation indexes.
+message AnnotatedCustomer {
+  optional string name = 1 [(com.apple.foundationdb.record.field).index = { type: "value" }];
+}
+
 // A record whose primary key and indexes are declared via FoundationDB field annotations,
-// exercising the proto-annotation metadata path.
+// exercising the proto-annotation metadata path (including a nested index).
 message AnnotatedOrder {
   optional int64 order_id = 1 [(com.apple.foundationdb.record.field).primary_key = true];
   optional string flower = 2;
   optional int64 price = 3 [(com.apple.foundationdb.record.field).index = { type: "value" }];
   repeated string tags = 4 [(com.apple.foundationdb.record.field).index = { type: "value" }];
+  optional AnnotatedCustomer customer = 5;
 }

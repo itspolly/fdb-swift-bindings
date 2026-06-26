@@ -35,8 +35,11 @@ import CFoundationDB
 /// ```
 // TODO: Remove hard-coded error codes.
 public final class FDBClient: Sendable {
-    /// FoundationDB API version constants.
-    public static let defaultApiVersion: Int = 710
+    /// The default FoundationDB API version selected by ``initialize(version:)``.
+    ///
+    /// 730 is the latest version the bundled client headers target. It is also ≥ 720, the
+    /// version at which the multi-tenant (``FDBTenant``) API became available.
+    public static let defaultApiVersion: Int = 730
 
     /// Initializes the FoundationDB client with the specified API version.
     ///

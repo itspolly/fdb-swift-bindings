@@ -55,20 +55,22 @@ extension RecordMetaData {
             extensions: Com_Apple_Foundationdb_Record_RecordMetadataOptions_Extensions
         )
 
-        var infoByName: [String: ProtoTypeInfo] = [:]
+        // Index every message by fully-qualified name so nested message fields can be resolved.
+        var messagesByName: [String: Google_Protobuf_DescriptorProto] = [:]
         for file in set.file {
             for message in file.messageType {
                 let fullName = file.package.isEmpty ? message.name : "\(file.package).\(message.name)"
-                infoByName[fullName] = ProtoTypeInfo(message)
+                messagesByName[fullName] = message
             }
         }
 
         var erased: [ErasedRecordType] = []
         for type in recordTypes {
             let name = type.protoMessageName
-            guard let info = infoByName[name] else {
+            guard let message = messagesByName[name] else {
                 throw ProtoMetaDataError.recordTypeNotInDescriptor(name)
             }
+            let info = ProtoTypeInfo(message, messages: messagesByName)
             guard !info.primaryKeyFields.isEmpty else {
                 throw ProtoMetaDataError.missingPrimaryKey(name)
             }
@@ -79,27 +81,58 @@ extension RecordMetaData {
     }
 }
 
-/// Parsed annotation info for one message in a descriptor.
+/// Parsed annotation info for one record type in a descriptor.
 private struct ProtoTypeInfo {
+    /// Top-level field numbers marked as primary key (nested primary keys are not supported).
     var primaryKeyFields: [Int] = []
+    /// Indexes, including ones nested inside singular message fields.
     var indexes: [IndexFieldInfo] = []
 
-    init(_ message: Google_Protobuf_DescriptorProto) {
-        for field in message.field {
-            guard field.hasOptions else { continue }
-            let options = field.options
-            guard options.hasCom_Apple_Foundationdb_Record_field else { continue }
-            let annotation = options.Com_Apple_Foundationdb_Record_field
-            if annotation.primaryKey {
+    init(_ message: Google_Protobuf_DescriptorProto, messages: [String: Google_Protobuf_DescriptorProto]) {
+        for field in message.field where field.hasOptions {
+            let annotation = field.options.Com_Apple_Foundationdb_Record_field
+            if field.options.hasCom_Apple_Foundationdb_Record_field, annotation.primaryKey {
                 primaryKeyFields.append(Int(field.number))
             }
-            if annotation.hasIndex {
-                indexes.append(IndexFieldInfo(
-                    name: "\(message.name).\(field.name)",
-                    number: Int(field.number),
-                    repeated: field.label == .repeated,
-                    type: IndexType(protoString: annotation.index.type)
-                ))
+        }
+        Self.collectIndexes(
+            message, path: [], namePrefix: "\(message.name).",
+            messages: messages, visited: [], into: &indexes
+        )
+    }
+
+    /// Recursively gathers annotated index fields, descending into singular message fields and
+    /// building each index's field-number path. `visited` guards against recursive types.
+    private static func collectIndexes(
+        _ message: Google_Protobuf_DescriptorProto,
+        path: [Int],
+        namePrefix: String,
+        messages: [String: Google_Protobuf_DescriptorProto],
+        visited: Set<String>,
+        into indexes: inout [IndexFieldInfo]
+    ) {
+        for field in message.field {
+            let fieldPath = path + [Int(field.number)]
+            if field.hasOptions, field.options.hasCom_Apple_Foundationdb_Record_field {
+                let annotation = field.options.Com_Apple_Foundationdb_Record_field
+                if annotation.hasIndex {
+                    indexes.append(IndexFieldInfo(
+                        name: "\(namePrefix)\(field.name)",
+                        path: fieldPath,
+                        repeated: field.label == .repeated,
+                        type: IndexType(protoString: annotation.index.type)
+                    ))
+                }
+            }
+            // Descend into singular message-typed fields to find nested indexes.
+            if field.type == .message, field.label != .repeated {
+                let typeName = field.typeName.hasPrefix(".") ? String(field.typeName.dropFirst()) : field.typeName
+                if let sub = messages[typeName], !visited.contains(typeName) {
+                    collectIndexes(
+                        sub, path: fieldPath, namePrefix: "\(namePrefix)\(field.name).",
+                        messages: messages, visited: visited.union([typeName]), into: &indexes
+                    )
+                }
             }
         }
     }
@@ -107,7 +140,8 @@ private struct ProtoTypeInfo {
 
 private struct IndexFieldInfo: Sendable {
     let name: String
-    let number: Int
+    /// Field-number path to the indexed field (one element for a top-level field).
+    let path: [Int]
     let repeated: Bool
     let type: IndexType
 }
@@ -150,9 +184,9 @@ private func makeErasedRecordType(
                     type: info.type,
                     subspaceKey: -1,
                     producesMultipleKeys: info.repeated,
-                    columnIdentities: [.fieldNumber(info.number)],
+                    columnIdentities: [.fieldPath(info.path)],
                     entries: { message in
-                        let values = extractFieldValues(message, fieldNumber: info.number)
+                        let values = extractFieldValues(message, fieldPath: info.path)
                         if info.repeated { return values.map { [$0] } }
                         return [[values.first ?? NullValue()]]
                     }
@@ -174,6 +208,19 @@ func extractFieldValues(_ message: any SwiftProtobuf.Message, fieldNumber: Int) 
     return visitor.collected
 }
 
+/// Extracts the value(s) at a (possibly nested) field-number path, descending through singular
+/// message fields. A single-element path is the top-level case above.
+func extractFieldValues(_ message: any SwiftProtobuf.Message, fieldPath: [Int]) -> [any TupleElement] {
+    guard let head = fieldPath.first else { return [] }
+    if fieldPath.count == 1 {
+        return extractFieldValues(message, fieldNumber: head)
+    }
+    var visitor = FieldValueVisitor(target: head)
+    try? message.traverse(visitor: &visitor)
+    guard let sub = visitor.capturedMessage else { return [] }
+    return extractFieldValues(sub, fieldPath: Array(fieldPath.dropFirst()))
+}
+
 /// A ``SwiftProtobuf/Visitor`` that captures the value(s) of a single field by number.
 ///
 /// Only the base visit methods (the ones swift-protobuf does not default) are implemented;
@@ -181,6 +228,8 @@ func extractFieldValues(_ message: any SwiftProtobuf.Message, fieldNumber: Int) 
 private struct FieldValueVisitor: SwiftProtobuf.Visitor {
     let target: Int
     var collected: [any TupleElement] = []
+    /// The sub-message at `target`, if the target field is a singular message (for nested paths).
+    var capturedMessage: (any SwiftProtobuf.Message)?
 
     mutating func visitSingularDoubleField(value: Double, fieldNumber: Int) throws {
         if fieldNumber == target { collected.append(value) }
@@ -204,7 +253,7 @@ private struct FieldValueVisitor: SwiftProtobuf.Visitor {
         if fieldNumber == target { collected.append(Int64(value.rawValue)) }
     }
     mutating func visitSingularMessageField<M: SwiftProtobuf.Message>(value: M, fieldNumber: Int) throws {
-        // Nested messages are not directly indexable as scalar key columns.
+        if fieldNumber == target { capturedMessage = value }
     }
     mutating func visitUnknown(bytes: Data) throws {}
     mutating func visitMapField<KeyType, ValueType: SwiftProtobuf.MapValueType>(

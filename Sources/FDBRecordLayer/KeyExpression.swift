@@ -42,12 +42,14 @@ public struct FieldID: Sendable, Hashable {
     /// Key-path *types* are not `Sendable`, but key-path *literals* are (SE-0418), so this is
     /// the `& Sendable`-refined existential to stay checked-`Sendable`.
     let keyPath: (any AnyKeyPath & Sendable)?
-    /// The protobuf field number, if known (proto annotations, or resolved from a key path).
-    let fieldNumber: Int?
+    /// The protobuf field-number path, if known (proto annotations, or resolved from a key
+    /// path). A top-level field is a single-element path `[n]`; a nested field carries the
+    /// chain of field numbers, e.g. `[4, 2]` for `customer.name`.
+    let fieldPath: [Int]?
 
-    init(keyPath: (any AnyKeyPath & Sendable)? = nil, fieldNumber: Int? = nil) {
+    init(keyPath: (any AnyKeyPath & Sendable)? = nil, fieldPath: [Int]? = nil) {
         self.keyPath = keyPath
-        self.fieldNumber = fieldNumber
+        self.fieldPath = fieldPath
     }
 
     /// An identity derived from a key path.
@@ -55,19 +57,24 @@ public struct FieldID: Sendable, Hashable {
         FieldID(keyPath: keyPath)
     }
 
-    /// An identity derived from a protobuf field number.
+    /// An identity derived from a top-level protobuf field number.
     public static func fieldNumber(_ number: Int) -> FieldID {
-        FieldID(fieldNumber: number)
+        FieldID(fieldPath: [number])
+    }
+
+    /// An identity derived from a (possibly nested) protobuf field-number path.
+    public static func fieldPath(_ path: [Int]) -> FieldID {
+        FieldID(fieldPath: path)
     }
 
     /// Whether two identities refer to the same field by *either* shared identity.
     ///
     /// This bridges the Swift DSL and proto-annotation styles: a query whose field identity
-    /// carries both a key path and a resolved field number matches an index declared with
+    /// carries both a key path and a resolved field-number path matches an index declared with
     /// only one of them.
     func matches(_ other: FieldID) -> Bool {
         if let a = keyPath, let b = other.keyPath, a == b { return true }
-        if let a = fieldNumber, let b = other.fieldNumber, a == b { return true }
+        if let a = fieldPath, let b = other.fieldPath, a == b { return true }
         return false
     }
 }

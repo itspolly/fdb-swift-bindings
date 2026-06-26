@@ -90,7 +90,7 @@ public enum Query {
     ) -> FieldComparison<M, V> {
         FieldComparison(
             keyPath: keyPath,
-            fieldID: FieldID(keyPath: keyPath, fieldNumber: FieldNumberResolver.resolve(keyPath))
+            fieldID: FieldID(keyPath: keyPath, fieldPath: FieldNumberResolver.resolve(keyPath))
         )
     }
 
@@ -100,7 +100,7 @@ public enum Query {
     ) -> OptionalFieldComparison<M, V> {
         OptionalFieldComparison(
             keyPath: keyPath,
-            fieldID: FieldID(keyPath: keyPath, fieldNumber: FieldNumberResolver.resolve(keyPath))
+            fieldID: FieldID(keyPath: keyPath, fieldPath: FieldNumberResolver.resolve(keyPath))
         )
     }
 
@@ -110,7 +110,7 @@ public enum Query {
     ) -> RepeatedFieldComparison<M, V> {
         RepeatedFieldComparison(
             keyPath: keyPath,
-            fieldID: FieldID(keyPath: keyPath, fieldNumber: FieldNumberResolver.resolve(keyPath))
+            fieldID: FieldID(keyPath: keyPath, fieldPath: FieldNumberResolver.resolve(keyPath))
         )
     }
 

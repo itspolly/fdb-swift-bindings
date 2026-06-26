@@ -61,6 +61,49 @@ try await database.withTransaction { transaction in
 }
 ```
 
+### Subspaces
+
+`Subspace` and `KeySpacePath` namespace keys by a common prefix and integrate directly with
+the transaction API — `pack`/`range`/`unpack` produce and consume the `[UInt8]` keys that
+`setValue`/`getRange`/`clearRange` already use:
+
+```swift
+let users = Subspace(Tuple("app", "users"))
+try await database.withTransaction { transaction in
+    transaction.setValue([UInt8]("alice".utf8), for: users.pack(Int64(1)))
+
+    let (begin, end) = users.range
+    for try await (key, value) in transaction.getRange(beginKey: begin, endKey: end) {
+        let id = try users.unpack(key)[0] as! Int64
+        print(id, String(decoding: value, as: UTF8.self))
+    }
+}
+```
+
+## Tenants
+
+FoundationDB [tenants](https://apple.github.io/foundationdb/tenants.html) give server-enforced,
+isolated key spaces within one database. The cluster must have `tenant_mode` enabled
+(`fdbcli --exec 'configure tenant_mode=optional_experimental'`), and the client must select API
+version ≥ 720 (the default is now 730).
+
+```swift
+try await database.createTenant(name: "tenant-a")
+let tenant = try database.openTenant(name: "tenant-a")
+
+try await tenant.withTransaction { transaction in
+    transaction.setValue([UInt8]("v".utf8), for: [UInt8]("k".utf8))
+}
+// The key "k" written above is invisible to other tenants and to the default key space.
+
+let id = try await tenant.id()
+let names = try await database.listTenants()
+try await database.deleteTenant(name: "tenant-a")  // tenant must be empty
+```
+
+Tenant transactions are ordinary `FDBTransaction`s, so they work with everything above —
+including `Subspace` and the Record Layer (`tenant.withRecordContext { … }`).
+
 ## Record Layer
 
 The optional `FDBRecordLayer` module is a Swift port of the [FoundationDB Record

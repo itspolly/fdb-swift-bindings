@@ -33,12 +33,14 @@ struct AnnotatedMetaDataTests {
         return try RecordMetaData(descriptorSetData: data, recordTypes: [Fdb_Test_AnnotatedOrder.self])
     }
 
-    private func make(id: Int64, flower: String = "rose", price: Int64 = 10, tags: [String] = []) -> Fdb_Test_AnnotatedOrder {
+    private func make(id: Int64, flower: String = "rose", price: Int64 = 10, tags: [String] = [],
+                      customer: String = "alice") -> Fdb_Test_AnnotatedOrder {
         var order = Fdb_Test_AnnotatedOrder()
         order.orderID = id
         order.flower = flower
         order.price = price
         order.tags = tags
+        order.customer.name = customer
         return order
     }
 
@@ -47,10 +49,21 @@ struct AnnotatedMetaDataTests {
         let meta = try metaData()
         let recordType = meta.recordType(for: Fdb_Test_AnnotatedOrder.self)
         #expect(recordType != nil)
-        // price and tags are both annotated as indexes.
-        #expect(recordType?.indexes.count == 2)
+        // price, tags, and the nested customer.name are all annotated as indexes.
+        #expect(recordType?.indexes.count == 3)
         // order_id (field 1) is the primary key.
         #expect(recordType?.primaryKeyIdentities == [FieldID.fieldNumber(1)])
+    }
+
+    @Test("a nested KeyPath query selects a nested annotation index")
+    func nestedCrossStyleMatching() throws {
+        let meta = try metaData()
+        let recordType = meta.recordType(for: Fdb_Test_AnnotatedOrder.self)!
+        // \.customer.name resolves to field path [5, 1]; the nested annotation index uses the
+        // same path, so the planner selects it.
+        let atoms = Query.field(\Fdb_Test_AnnotatedOrder.customer.name).equals("alice").atoms
+        let plan = QueryPlanner.plan(recordType: recordType, atoms: atoms)
+        #expect(plan.indexName == "AnnotatedOrder.customer.name")
     }
 
     @Test("save/load round-trips using the annotated primary key")
@@ -69,9 +82,9 @@ struct AnnotatedMetaDataTests {
         let meta = try metaData()
         try await RecordLayerTestCase.withStore(metaData: meta) { run in
             _ = try await run { try await $0.save(self.make(id: 1, price: 10, tags: ["red", "white"])) }
-            // price (1 entry) + tags fan-out (2 entries) = 3 index entries.
+            // price (1) + tags fan-out (2) + nested customer.name (1) = 4 index entries.
             let count = try await run { try await $0.allIndexKeys().count }
-            #expect(count == 3)
+            #expect(count == 4)
         }
     }
 
