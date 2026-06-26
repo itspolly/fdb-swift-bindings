@@ -35,6 +35,8 @@ public enum RecordStoreError: Error, Sendable {
     case unsupportedIndexType(IndexType)
     /// A query referenced an index name not present on the record type.
     case unknownIndex(String)
+    /// A covering query's filter is not fully satisfiable by the named index alone.
+    case queryNotCovered(String)
 }
 
 /// The primary entry point for storing, retrieving, and querying records.

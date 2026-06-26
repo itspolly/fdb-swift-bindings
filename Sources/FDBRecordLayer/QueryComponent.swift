@@ -53,6 +53,28 @@ struct IndexableAtom: Sendable {
     let bound: any TupleElement
 }
 
+/// The logical structure of a predicate, used by the planner (the parallel `eval` closure on
+/// ``QueryComponent`` handles residual, in-memory filtering).
+indirect enum PredicateNode: Sendable {
+    /// An index-eligible comparison.
+    case comparison(IndexableAtom)
+    /// A leaf the planner cannot satisfy with a range (notEquals/startsWith/isNull/notNull).
+    case unindexable
+    case and([PredicateNode])
+    case or([PredicateNode])
+    case not(PredicateNode)
+
+    /// The conjunction's index-eligible comparisons, flattening nested `and`s. Empty for
+    /// `or`/`not`/`unindexable` (so a single comparison or an AND-of-comparisons yields atoms).
+    var conjunctionAtoms: [IndexableAtom] {
+        switch self {
+        case .comparison(let atom): return [atom]
+        case .and(let children): return children.flatMap { $0.conjunctionAtoms }
+        case .or, .not, .unindexable: return []
+        }
+    }
+}
+
 /// A query predicate over records of type `M`.
 ///
 /// Components are built with the fluent ``Query`` API and combined with `and`/`or`/`not`:
@@ -69,12 +91,15 @@ struct IndexableAtom: Sendable {
 public struct QueryComponent<M>: Sendable {
     /// Evaluates the predicate against a record (used for residual, in-memory filtering).
     let eval: @Sendable (M) -> Bool
-    /// Conjuncts the planner may turn into an index scan (empty for `or`/`not`).
-    let atoms: [IndexableAtom]
+    /// The predicate's logical structure, used by the planner.
+    let node: PredicateNode
 
-    init(eval: @escaping @Sendable (M) -> Bool, atoms: [IndexableAtom]) {
+    /// The top-level conjunction's index-eligible comparisons.
+    var atoms: [IndexableAtom] { node.conjunctionAtoms }
+
+    init(eval: @escaping @Sendable (M) -> Bool, node: PredicateNode) {
         self.eval = eval
-        self.atoms = atoms
+        self.node = node
     }
 }
 
@@ -118,7 +143,7 @@ public enum Query {
     public static func and<M>(_ components: [QueryComponent<M>]) -> QueryComponent<M> {
         QueryComponent(
             eval: { record in components.allSatisfy { $0.eval(record) } },
-            atoms: components.flatMap { $0.atoms }
+            node: .and(components.map { $0.node })
         )
     }
 
@@ -127,11 +152,12 @@ public enum Query {
         and(components)
     }
 
-    /// True when any component matches. Not index-eligible (evaluated in memory).
+    /// True when any component matches. The planner satisfies this via an index union when
+    /// every branch is independently index-able, else a full scan.
     public static func or<M>(_ components: [QueryComponent<M>]) -> QueryComponent<M> {
         QueryComponent(
             eval: { record in components.contains { $0.eval(record) } },
-            atoms: []
+            node: .or(components.map { $0.node })
         )
     }
 
@@ -142,7 +168,7 @@ public enum Query {
 
     /// Negates a component. Not index-eligible (evaluated in memory).
     public static func not<M>(_ component: QueryComponent<M>) -> QueryComponent<M> {
-        QueryComponent(eval: { record in !component.eval(record) }, atoms: [])
+        QueryComponent(eval: { record in !component.eval(record) }, node: .not(component.node))
     }
 }
 
@@ -162,10 +188,13 @@ public struct FieldComparison<M, V: IndexableValue & Comparable> {
         _ kind: ComparisonKind, _ value: V, _ test: @escaping @Sendable (V) -> Bool
     ) -> QueryComponent<M> {
         let keyPath = self.keyPath
-        let atoms = kind.isIndexable
-            ? [IndexableAtom(fieldID: fieldID, kind: kind, bound: value.asTupleElement())]
-            : []
-        return QueryComponent(eval: { test($0[keyPath: keyPath]) }, atoms: atoms)
+        return QueryComponent(eval: { test($0[keyPath: keyPath]) }, node: Self.node(kind, fieldID, value))
+    }
+
+    static func node(_ kind: ComparisonKind, _ fieldID: FieldID, _ value: V) -> PredicateNode {
+        kind.isIndexable
+            ? .comparison(IndexableAtom(fieldID: fieldID, kind: kind, bound: value.asTupleElement()))
+            : .unindexable
     }
 }
 
@@ -173,7 +202,7 @@ extension FieldComparison where V == String {
     /// String prefix match. Evaluated in memory (not index-eligible in this version).
     public func startsWith(_ prefix: String) -> QueryComponent<M> {
         let keyPath = self.keyPath
-        return QueryComponent(eval: { $0[keyPath: keyPath].hasPrefix(prefix) }, atoms: [])
+        return QueryComponent(eval: { $0[keyPath: keyPath].hasPrefix(prefix) }, node: .unindexable)
     }
 }
 
@@ -189,25 +218,25 @@ public struct OptionalFieldComparison<M, V: IndexableValue & Comparable> {
     /// Matches records where the field is absent.
     public func isNull() -> QueryComponent<M> {
         let keyPath = self.keyPath
-        return QueryComponent(eval: { $0[keyPath: keyPath] == nil }, atoms: [])
+        return QueryComponent(eval: { $0[keyPath: keyPath] == nil }, node: .unindexable)
     }
 
     /// Matches records where the field is present.
     public func notNull() -> QueryComponent<M> {
         let keyPath = self.keyPath
-        return QueryComponent(eval: { $0[keyPath: keyPath] != nil }, atoms: [])
+        return QueryComponent(eval: { $0[keyPath: keyPath] != nil }, node: .unindexable)
     }
 
     private func make(
         _ kind: ComparisonKind, _ value: V, _ test: @escaping @Sendable (V) -> Bool
     ) -> QueryComponent<M> {
         let keyPath = self.keyPath
-        let atoms = kind.isIndexable
-            ? [IndexableAtom(fieldID: fieldID, kind: kind, bound: value.asTupleElement())]
-            : []
+        let node: PredicateNode = kind.isIndexable
+            ? .comparison(IndexableAtom(fieldID: fieldID, kind: kind, bound: value.asTupleElement()))
+            : .unindexable
         return QueryComponent(
             eval: { record in record[keyPath: keyPath].map(test) ?? false },
-            atoms: atoms
+            node: node
         )
     }
 }
@@ -222,7 +251,7 @@ public struct RepeatedFieldComparison<M, V: IndexableValue & Comparable> {
         let keyPath = self.keyPath
         return QueryComponent(
             eval: { $0[keyPath: keyPath].contains(value) },
-            atoms: [IndexableAtom(fieldID: fieldID, kind: .equals, bound: value.asTupleElement())]
+            node: .comparison(IndexableAtom(fieldID: fieldID, kind: .equals, bound: value.asTupleElement()))
         )
     }
 }

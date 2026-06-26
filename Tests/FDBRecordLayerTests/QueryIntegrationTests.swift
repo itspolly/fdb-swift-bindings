@@ -124,5 +124,87 @@ struct QueryIntegrationTests {
             #expect(prices == [30, 10]) // descending
         }
     }
+
+    @Test("equality + range AND uses the composite index")
+    func multiColumnRange() async throws {
+        try await RecordLayerTestCase.withStore { run in
+            try await seed(run)
+            // rose orders are 1 (price 10) and 3 (price 30); only 1 has price < 30.
+            let ids = try await run { store in
+                try await self.ids(try await store.executeQuery(
+                    RecordQuery(Fdb_Test_Order.self).where(Query.and(
+                        Query.field(\.flower).equals("rose"),
+                        Query.field(\.price).lessThan(30)
+                    ))))
+            }
+            #expect(ids == [1])
+        }
+    }
+
+    @Test("OR query unions index scans and de-duplicates")
+    func orUnion() async throws {
+        try await RecordLayerTestCase.withStore { run in
+            try await seed(run)
+            let ids = try await run { store in
+                try await self.ids(try await store.executeQuery(
+                    RecordQuery(Fdb_Test_Order.self).where(Query.or(
+                        Query.field(\.price).equals(10),
+                        Query.field(\.price).equals(40)
+                    ))))
+            }
+            #expect(ids == [1, 4])
+        }
+    }
+
+    @Test("covering query returns index entries without loading records")
+    func coveringQuery() async throws {
+        try await RecordLayerTestCase.withStore { run in
+            try await seed(run)
+            let covered = try await run { store in
+                try await store.executeCoveringQuery(
+                    RecordQuery(Fdb_Test_Order.self).where(Query.field(\.price).equals(20)),
+                    using: "order.price")
+            }
+            #expect(covered.count == 1)
+            #expect(covered.first?.primaryKey == Tuple(Int64(2)))
+            #expect(covered.first?.columns.first as? Int64 == 20)
+        }
+    }
+
+    @Test("covering query throws when the filter is not covered by the index")
+    func coveringQueryNotCovered() async throws {
+        try await RecordLayerTestCase.withStore { run in
+            try await seed(run)
+            var thrown: Error?
+            do {
+                _ = try await run { store in
+                    try await store.executeCoveringQuery(
+                        RecordQuery(Fdb_Test_Order.self).where(Query.and(
+                            Query.field(\.price).equals(20),
+                            Query.field(\.flower).equals("tulip")
+                        )),
+                        using: "order.price")
+                }
+            } catch {
+                thrown = error
+            }
+            #expect(thrown is RecordStoreError)
+        }
+    }
+
+    @Test("count matches executeQuery for covered and uncovered filters")
+    func countFastPath() async throws {
+        try await RecordLayerTestCase.withStore { run in
+            try await seed(run)
+            let (covered, residual, all) = try await run { store in
+                (try await store.count(RecordQuery(Fdb_Test_Order.self).where(Query.field(\.price).lessThan(30))),
+                 try await store.count(RecordQuery(Fdb_Test_Order.self).where(Query.field(\.flower).equals("rose"))),
+                 try await store.count(RecordQuery(Fdb_Test_Order.self)))
+            }
+            #expect(covered == 2)  // prices 10, 20 (index-only)
+            #expect(residual == 2) // rose: ids 1, 3 (full scan + residual)
+            #expect(all == 4)
+        }
+    }
 }
 #endif

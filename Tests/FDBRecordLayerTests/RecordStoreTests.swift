@@ -112,19 +112,19 @@ struct RecordStoreTests {
     @Test("value indexes are created, diffed, and removed")
     func indexMaintenance() async throws {
         try await RecordLayerTestCase.withStore { run in
-            // price (1) + 2 tags fan-out (2) + customerName (1) = 4 index entries.
+            // price(1) + 2 tags fan-out(2) + customerName(1) + flowerPrice(1) = 5 index entries.
             try await run { store in
                 try await store.save(Fdb_Test_Order.sample(id: 5, price: 10, tags: ["a", "b"]))
             }
             let afterInsert = try await run { try await $0.allIndexKeys().count }
-            #expect(afterInsert == 4)
+            #expect(afterInsert == 5)
 
-            // Updating tags to a single value should leave: price(1) + 1 tag + name(1) = 3.
+            // Updating tags to a single value leaves: price(1) + 1 tag + name(1) + flowerPrice(1) = 4.
             try await run { store in
                 try await store.save(Fdb_Test_Order.sample(id: 5, price: 10, tags: ["c"]))
             }
             let afterUpdate = try await run { try await $0.allIndexKeys().count }
-            #expect(afterUpdate == 3)
+            #expect(afterUpdate == 4)
 
             // Deleting the record removes all of its index entries.
             try await run { try await $0.delete(Fdb_Test_Order.self, primaryKey: Tuple(Int64(5))) }

@@ -61,8 +61,8 @@ struct AnnotatedMetaDataTests {
         let recordType = meta.recordType(for: Fdb_Test_AnnotatedOrder.self)!
         // \.customer.name resolves to field path [5, 1]; the nested annotation index uses the
         // same path, so the planner selects it.
-        let atoms = Query.field(\Fdb_Test_AnnotatedOrder.customer.name).equals("alice").atoms
-        let plan = QueryPlanner.plan(recordType: recordType, atoms: atoms)
+        let node = Query.field(\Fdb_Test_AnnotatedOrder.customer.name).equals("alice").node
+        let plan = QueryPlanner.plan(recordType: recordType, node: node)
         #expect(plan.indexName == "AnnotatedOrder.customer.name")
     }
 
@@ -94,8 +94,8 @@ struct AnnotatedMetaDataTests {
         let recordType = meta.recordType(for: Fdb_Test_AnnotatedOrder.self)!
         // The query uses a KeyPath; the index was declared by proto field number. They match
         // because the KeyPath resolves to field number 3 (price).
-        let atoms = Query.field(\Fdb_Test_AnnotatedOrder.price).equals(20).atoms
-        let plan = QueryPlanner.plan(recordType: recordType, atoms: atoms)
+        let node = Query.field(\Fdb_Test_AnnotatedOrder.price).equals(20).node
+        let plan = QueryPlanner.plan(recordType: recordType, node: node)
         #expect(plan.indexName == "AnnotatedOrder.price")
     }
 

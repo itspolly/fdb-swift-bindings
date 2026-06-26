@@ -236,6 +236,22 @@ try await database.withRecordContext { context in
 `Query.any(\.tags).equals("red")` matches a repeated field via a fan-out index (results are
 de-duplicated).
 
+The planner uses **multi-column index prefixes** (an equality prefix plus a trailing range,
+e.g. a `concat(flower, price)` index for `flower == "rose" AND price < 50`) and satisfies an
+`OR` of index-able branches with a **de-duplicated union** of index scans, falling back to a
+full scan otherwise.
+
+For queries that only need indexed columns, **covering reads** skip the record fetch entirely:
+
+```swift
+// Returns (primaryKey, [columns]) straight from the index — no record load.
+let entries = try await store.executeCoveringQuery(
+    RecordQuery(Order.self).where(Query.field(\.price).equals(20)), using: "priceIdx")
+
+// count() tallies matches by scanning index ranges only when the filter is fully covered.
+let n = try await store.count(RecordQuery(Order.self).where(Query.field(\.price).lessThan(50)))
+```
+
 ### Advanced indexes
 
 Declare aggregate, rank, and version indexes via the `type:` parameter, and read them with

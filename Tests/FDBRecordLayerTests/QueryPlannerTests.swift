@@ -30,7 +30,7 @@ struct QueryPlannerTests {
 
     private func plan(_ filter: QueryComponent<Fdb_Test_Order>) -> QueryPlan {
         let recordType = meta.recordType(for: Fdb_Test_Order.self)!
-        return QueryPlanner.plan(recordType: recordType, atoms: filter.atoms)
+        return QueryPlanner.plan(recordType: recordType, node: filter.node)
     }
 
     @Test("equality on an indexed field selects that index")
@@ -47,8 +47,10 @@ struct QueryPlannerTests {
 
     @Test("comparison on an unindexed field falls back to a full scan")
     func unindexedFallsBack() {
-        let plan = plan(Query.field(\Fdb_Test_Order.flower).equals("rose"))
+        // customer.id has no index (customer.name does).
+        let plan = plan(Query.field(\Fdb_Test_Order.customer.id).equals(5))
         #expect(plan.indexName == nil)
+        #expect(plan.unionIndexNames == nil)
     }
 
     @Test("nested-field index is selected")
@@ -75,13 +77,53 @@ struct QueryPlannerTests {
         #expect(plan.requiresDistinct)
     }
 
-    @Test("OR is not index-eligible")
-    func orNotIndexed() {
+    @Test("equality + range AND selects the composite multi-column index")
+    func multiColumnPrefix() {
+        let plan = plan(Query.and(
+            Query.field(\Fdb_Test_Order.flower).equals("rose"),
+            Query.field(\Fdb_Test_Order.price).lessThan(50)
+        ))
+        // flowerPrice covers [flower, price] (prefix length 2), beating the single price index.
+        #expect(plan.indexName == "order.flowerPrice")
+    }
+
+    @Test("OR of index-able branches plans a union")
+    func orUnion() {
         let plan = plan(Query.or(
             Query.field(\Fdb_Test_Order.price).equals(10),
             Query.field(\Fdb_Test_Order.price).equals(20)
         ))
         #expect(plan.indexName == nil)
+        #expect(plan.unionIndexNames == ["order.price", "order.price"])
+        #expect(plan.requiresDistinct)
+    }
+
+    @Test("OR with an unindexed branch falls back to a full scan")
+    func orFallsBack() {
+        let plan = plan(Query.or(
+            Query.field(\Fdb_Test_Order.price).equals(10),
+            Query.field(\Fdb_Test_Order.customer.id).equals(5)
+        ))
+        #expect(plan.indexName == nil)
+        #expect(plan.unionIndexNames == nil)
+    }
+
+    @Test("coverage detection: a single equality is covered, an extra residual is not")
+    func coverage() throws {
+        let recordType = meta.recordType(for: Fdb_Test_Order.self)!
+        let priceIndex = recordType.indexes.first { $0.name == "order.price" }!
+
+        let coveredNode = Query.field(\Fdb_Test_Order.price).equals(10).node
+        let coveredScan = QueryPlanner.scan(index: priceIndex, atoms: coveredNode.conjunctionAtoms)!
+        #expect(QueryPlanner.isFullyCovered(coveredNode, by: coveredScan))
+
+        // price index can't cover an extra predicate on flower.
+        let residualNode = Query.and(
+            Query.field(\Fdb_Test_Order.price).equals(10),
+            Query.field(\Fdb_Test_Order.flower).equals("rose")
+        ).node
+        let residualScan = QueryPlanner.scan(index: priceIndex, atoms: residualNode.conjunctionAtoms)!
+        #expect(!QueryPlanner.isFullyCovered(residualNode, by: residualScan))
     }
 }
 #endif

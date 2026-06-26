@@ -53,6 +53,7 @@ enum RecordLayerTestCase {
                 .index("order.price", on: \.price)
                 .index("order.byTag", on: \.tags, fanType: .fanOut)
                 .index("order.customerName", on: \.customer.name)
+                .index("order.flowerPrice", on: .concat(.field(\.flower), .field(\.price)))
             RecordType(Fdb_Test_Item.self, primaryKey: \.sku)
                 .index("item.category", on: \.category)
         }
