@@ -67,4 +67,43 @@ struct ValueIndexMaintainer: IndexMaintainer {
         indexSubspace.prefix + Tuple(entry).encode() + primaryKeyEncoded
     }
 }
+
+/// A value index that enforces uniqueness: before adding an entry it checks that no *other*
+/// primary key already holds the same index key, throwing
+/// ``RecordStoreError/uniquenessViolation(index:)`` if so.
+///
+/// The range read also makes concurrent inserts of the same value conflict in FoundationDB, so
+/// two transactions can't both create a duplicate.
+struct UniqueValueIndexMaintainer: IndexMaintainer {
+    let indexName: String
+
+    func update(
+        transaction: any TransactionProtocol,
+        indexSubspace: Subspace,
+        oldEntries: [[any TupleElement]],
+        newEntries: [[any TupleElement]],
+        primaryKeyEncoded: FDB.Bytes
+    ) async throws {
+        let oldKeys = Set(oldEntries.map { indexSubspace.prefix + Tuple($0).encode() + primaryKeyEncoded })
+        let newKeys = Set(newEntries.map { indexSubspace.prefix + Tuple($0).encode() + primaryKeyEncoded })
+
+        for removed in oldKeys.subtracting(newKeys) {
+            transaction.clear(key: removed)
+        }
+
+        for entry in newEntries {
+            let entryPrefix = indexSubspace.prefix + Tuple(entry).encode()
+            let fullKey = entryPrefix + primaryKeyEncoded
+            if oldKeys.contains(fullKey) { continue } // unchanged entry for this record
+
+            // Any existing entry under these columns belongs to a different primary key.
+            for try await (existing, _) in transaction.getRange(
+                beginKey: entryPrefix + [0x00], endKey: entryPrefix + [0xFF]
+            ) where existing != fullKey {
+                throw RecordStoreError.uniquenessViolation(index: indexName)
+            }
+            transaction.setValue([], for: fullKey)
+        }
+    }
+}
 #endif

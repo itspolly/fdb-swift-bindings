@@ -65,12 +65,20 @@ public struct Index<M: SwiftProtobuf.Message>: Sendable {
     /// layout is independent of declaration order; when `nil`, a positional key is assigned.
     /// Treat keys like protobuf field numbers: never reuse a retired one.
     public let key: Int?
+    /// Whether the index enforces uniqueness: a `save` that would give two records the same
+    /// index key fails with ``RecordStoreError/uniquenessViolation(index:)``. Applies to
+    /// `.value` indexes.
+    public let unique: Bool
 
-    public init(_ name: String, _ expression: KeyExpression<M>, type: IndexType = .value, key: Int? = nil) {
+    public init(
+        _ name: String, _ expression: KeyExpression<M>,
+        type: IndexType = .value, key: Int? = nil, unique: Bool = false
+    ) {
         self.name = name
         self.type = type
         self.expression = expression
         self.key = key
+        self.unique = unique
     }
 }
 #endif

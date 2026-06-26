@@ -125,7 +125,8 @@ private struct ProtoTypeInfo {
                         name: "\(namePrefix)\(field.name)",
                         path: fieldPath,
                         repeated: field.label == .repeated,
-                        type: IndexType(protoString: annotation.index.type)
+                        type: IndexType(protoString: annotation.index.type),
+                        unique: annotation.index.unique
                     ))
                 }
             }
@@ -149,6 +150,7 @@ private struct IndexFieldInfo: Sendable {
     let path: [Int]
     let repeated: Bool
     let type: IndexType
+    let unique: Bool
 }
 
 extension IndexType {
@@ -190,6 +192,7 @@ private func makeErasedRecordType(
                     type: info.type,
                     subspaceKey: -1,
                     explicitKey: nil,
+                    unique: info.unique,
                     producesMultipleKeys: info.repeated,
                     columnIdentities: [.fieldPath(info.path)],
                     entries: { message in

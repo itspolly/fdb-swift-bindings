@@ -290,6 +290,18 @@ RecordMetaData {
 To retire an index: `try await store.clearIndex(named: "price")` (wipes its data), then drop it
 from the schema and never reuse its key. Clearing one index never affects another.
 
+### Unique indexes
+
+Mark a value index `unique: true` to enforce a uniqueness constraint — a `save` that would give
+two records the same index key fails with `RecordStoreError.uniquenessViolation`. A unique index
+is still a normal queryable value index (it just adds a write-time check), and composes with
+other indexes on the same type.
+
+```swift
+RecordType(User.self, key: 1, primaryKey: \.id)
+    .index("email", on: \.email, key: 10, unique: true)
+```
+
 ### Paging
 
 Set a `limit` and page with an opaque continuation token (stateless — safe to hand to an API

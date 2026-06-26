@@ -73,25 +73,29 @@ public struct RecordType<M: SwiftProtobuf.Message>: ErasableRecordType, Sendable
     // MARK: Index builders (chainable)
 
     /// Adds an index built from an arbitrary key expression.
-    public func index(_ name: String, on expression: KeyExpression<M>, type: IndexType = .value, key: Int? = nil) -> RecordType<M> {
+    public func index(
+        _ name: String, on expression: KeyExpression<M>,
+        type: IndexType = .value, key: Int? = nil, unique: Bool = false
+    ) -> RecordType<M> {
         var copy = self
-        copy.indexes.append(Index(name, expression, type: type, key: key))
+        copy.indexes.append(Index(name, expression, type: type, key: key, unique: unique))
         return copy
     }
 
     /// Adds a single-field (possibly nested) value index.
     public func index<V: IndexableValue>(
-        _ name: String, on keyPath: KeyPath<M, V> & Sendable, type: IndexType = .value, key: Int? = nil
+        _ name: String, on keyPath: KeyPath<M, V> & Sendable,
+        type: IndexType = .value, key: Int? = nil, unique: Bool = false
     ) -> RecordType<M> {
-        index(name, on: .field(keyPath), type: type, key: key)
+        index(name, on: .field(keyPath), type: type, key: key, unique: unique)
     }
 
     /// Adds an index over a repeated field.
     public func index<V: IndexableValue>(
         _ name: String, on keyPath: KeyPath<M, [V]> & Sendable, fanType: FanType = .fanOut,
-        type: IndexType = .value, key: Int? = nil
+        type: IndexType = .value, key: Int? = nil, unique: Bool = false
     ) -> RecordType<M> {
-        index(name, on: .field(keyPath, fanType), type: type, key: key)
+        index(name, on: .field(keyPath, fanType), type: type, key: key, unique: unique)
     }
 
     func _erase() -> ErasedRecordType {
@@ -102,6 +106,7 @@ public struct RecordType<M: SwiftProtobuf.Message>: ErasableRecordType, Sendable
                 type: idx.type,
                 subspaceKey: -1,
                 explicitKey: idx.key,
+                unique: idx.unique,
                 producesMultipleKeys: idx.expression.producesMultipleKeys,
                 columnIdentities: idx.expression.columnIdentities,
                 entries: { message in idx.expression.evaluate(message as! M) }
@@ -129,6 +134,8 @@ struct ErasedIndex: Sendable {
     var subspaceKey: Int
     /// Caller-supplied stable key, if any (otherwise positional).
     let explicitKey: Int?
+    /// Whether the index enforces uniqueness.
+    let unique: Bool
     let producesMultipleKeys: Bool
     let columnIdentities: [FieldID?]
     /// Computes the index entries (columns, before the primary key) for a record.

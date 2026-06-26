@@ -37,6 +37,8 @@ public enum RecordStoreError: Error, Sendable {
     case unknownIndex(String)
     /// A covering query's filter is not fully satisfiable by the named index alone.
     case queryNotCovered(String)
+    /// A save would violate a unique index (another record already has the same key).
+    case uniquenessViolation(index: String)
 }
 
 /// The primary entry point for storing, retrieving, and querying records.
@@ -175,7 +177,7 @@ public final class FDBRecordStore {
             let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
             let oldEntries = oldMessage.map { index.entries($0) } ?? []
             let newEntries = index.entries(record)
-            try await indexMaintainer(for: index.type).update(
+            try await indexMaintainer(for: index).update(
                 transaction: transaction,
                 indexSubspace: indexSubspace,
                 oldEntries: oldEntries,
@@ -224,7 +226,7 @@ public final class FDBRecordStore {
         let primaryKeyEncoded = primaryKey.encode()
         for index in recordType.indexes where indexState(named: index.name) != .disabled {
             let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
-            try await indexMaintainer(for: index.type).update(
+            try await indexMaintainer(for: index).update(
                 transaction: transaction,
                 indexSubspace: indexSubspace,
                 oldEntries: index.entries(oldMessage),
@@ -313,7 +315,7 @@ public final class FDBRecordStore {
             limit: batchSize, snapshot: false)
 
         let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
-        let maintainer = try indexMaintainer(for: index.type)
+        let maintainer = try indexMaintainer(for: index)
         var lastPrimaryKeyEncoded: FDB.Bytes?
         for (key, value) in batch.records {
             let primaryKeyEncoded = Array(key.dropFirst(typeSubspace.prefix.count))
@@ -343,16 +345,19 @@ public final class FDBRecordStore {
 
     // MARK: - Internals
 
-    func indexMaintainer(for type: IndexType) throws -> any IndexMaintainer {
-        switch type {
+    func indexMaintainer(for index: ErasedIndex) throws -> any IndexMaintainer {
+        switch index.type {
         case .value, .rank, .min, .max:
             // These all store ordered (columns..., primaryKey) entries like a value index.
             // - rank: position is derived by counting entries before a value.
             // - min/max: the extremum is the first/last entry in a group's range, so deletes
             //   are handled correctly (no atomic-accumulator that can't be decremented).
+            if index.unique, index.type == .value {
+                return UniqueValueIndexMaintainer(indexName: index.name)
+            }
             return ValueIndexMaintainer()
         case .count, .sum:
-            return AggregateIndexMaintainer(kind: type)
+            return AggregateIndexMaintainer(kind: index.type)
         case .version:
             return VersionIndexMaintainer()
         }
