@@ -1,0 +1,43 @@
+/*
+ * record_metadata_options.proto
+ *
+ * Vendored, minimal subset of FoundationDB Record Layer's field annotations, allowing record
+ * metadata to be declared inline in a user's `.proto`:
+ *
+ *   message Order {
+ *     optional int64 order_id = 1 [(com.apple.foundationdb.record.field).primary_key = true];
+ *     optional int64 price    = 2 [(com.apple.foundationdb.record.field).index = { type: "value" }];
+ *   }
+ *
+ * The package, the extension number (1233), and the FieldOptions layout match the canonical
+ * file in github.com/FoundationDB/fdb-record-layer so existing annotated protos are
+ * understood. This subset covers primary keys and value indexes.
+ *
+ * Licensed under the Apache License, Version 2.0.
+ */
+
+syntax = "proto2";
+
+package com.apple.foundationdb.record;
+
+import "google/protobuf/descriptor.proto";
+
+// Options describing an index built from a field.
+message IndexOption {
+  // The index type: "value" (default), "count", "sum", "rank", or "version".
+  optional string type = 1 [default = "value"];
+  // Whether the index enforces uniqueness (not yet enforced by the Swift layer).
+  optional bool unique = 2 [default = false];
+}
+
+// Field-level record metadata options.
+message FieldOptions {
+  // Marks this field as (part of) the record type's primary key.
+  optional bool primary_key = 2;
+  // Declares an index built from this field.
+  optional IndexOption index = 3;
+}
+
+extend google.protobuf.FieldOptions {
+  optional FieldOptions field = 1233;
+}

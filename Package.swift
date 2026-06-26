@@ -18,7 +18,7 @@
  * limitations under the License.
  */
 
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 import PackageDescription
 
 let package = Package(
@@ -28,6 +28,17 @@ let package = Package(
     ],
     products: [
         .library(name: "FoundationDB", targets: ["FoundationDB"]),
+        // The Record Layer is only non-empty when the `RecordLayer` trait is enabled.
+        .library(name: "FDBRecordLayer", targets: ["FDBRecordLayer"]),
+    ],
+    traits: [
+        // Enables the Record Layer (and pulls in swift-protobuf). Off by default so the
+        // base `FoundationDB` library stays free of the protobuf dependency.
+        .trait(name: "RecordLayer"),
+        .default(enabledTraits: []),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-protobuf", from: "1.29.0"),
     ],
     targets: [
         .systemLibrary(
@@ -42,9 +53,38 @@ let package = Package(
             name: "FoundationDB",
             dependencies: ["CFoundationDB"]
         ),
+        .target(
+            name: "FDBRecordLayer",
+            dependencies: [
+                "FoundationDB",
+                // Trait-gated: when `RecordLayer` is off, swift-protobuf is not linked and
+                // the (entirely `#if RecordLayer`-guarded) sources compile to nothing.
+                .product(
+                    name: "SwiftProtobuf",
+                    package: "swift-protobuf",
+                    condition: .when(traits: ["RecordLayer"])
+                ),
+            ],
+            // The vendored `.proto` is reference material (its Swift is checked into
+            // Generated/); it is not compiled by this target.
+            exclude: ["Proto/record_metadata_options.proto"]
+        ),
         .testTarget(
             name: "FoundationDBTests",
             dependencies: ["FoundationDB"]
+        ),
+        .testTarget(
+            name: "FDBRecordLayerTests",
+            dependencies: [
+                "FDBRecordLayer",
+                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
+            // Import-only proto (resolves annotated.proto's import); not generated itself.
+            exclude: ["Protos/record_metadata_options.proto"],
+            plugins: [
+                // Generates Swift types from the `.proto` files in this target at build time.
+                .plugin(name: "SwiftProtobufPlugin", package: "swift-protobuf"),
+            ]
         ),
         .executableTarget(
             name: "StackTester",

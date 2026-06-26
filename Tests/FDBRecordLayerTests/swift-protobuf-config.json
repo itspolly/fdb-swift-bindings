@@ -1,0 +1,12 @@
+{
+  "invocations": [
+    {
+      "protoPath": "Protos",
+      "protoFiles": [
+        "test_records.proto",
+        "annotated.proto"
+      ],
+      "visibility": "public"
+    }
+  ]
+}

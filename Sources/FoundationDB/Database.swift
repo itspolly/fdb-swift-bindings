@@ -30,8 +30,11 @@ import CFoundationDB
 /// let database = try FDBClient.openDatabase()
 /// let transaction = try database.createTransaction()
 /// ```
-public final class FDBDatabase: DatabaseProtocol {
+public final class FDBDatabase: DatabaseProtocol, @unchecked Sendable {
     /// The underlying FoundationDB database pointer.
+    ///
+    /// FoundationDB database handles are safe to use concurrently from multiple threads, so
+    /// this immutable wrapper is `@unchecked Sendable`.
     private let database: OpaquePointer
 
     /// Initializes a new database instance with the given database pointer.

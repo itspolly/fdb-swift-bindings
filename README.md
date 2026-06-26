@@ -61,6 +61,165 @@ try await database.withTransaction { transaction in
 }
 ```
 
+## Record Layer
+
+The optional `FDBRecordLayer` module is a Swift port of the [FoundationDB Record
+Layer](https://foundationdb.github.io/fdb-record-layer/Overview.html): a schema-driven store
+for [Protocol Buffer](https://github.com/apple/swift-protobuf) records, with a clustered
+primary-key index, secondary indexes, and a query planner — all layered on the low-level
+bindings above.
+
+It is gated behind the **`RecordLayer` package trait** so the base `FoundationDB` library
+stays free of the swift-protobuf dependency unless you opt in. Enable it on your dependency:
+
+```swift
+dependencies: [
+    .package(
+        url: "https://github.com/FoundationDB/fdb-swift-bindings",
+        branch: "main",
+        traits: ["RecordLayer"]
+    )
+],
+targets: [
+    .target(name: "MyApp", dependencies: [
+        .product(name: "FDBRecordLayer", package: "fdb-swift-bindings"),
+    ])
+]
+```
+
+### Define records
+
+Records are protobuf messages. Compile your `.proto` with
+[swift-protobuf](https://github.com/apple/swift-protobuf) (the `SwiftProtobufPlugin` build
+plugin is convenient):
+
+```protobuf
+syntax = "proto3";
+package example;
+
+message Customer { int64 id = 1; string name = 2; }
+message Order {
+  int64 order_id = 1;
+  string flower = 2;
+  int64 price = 3;
+  Customer customer = 4;
+  repeated string tags = 5;
+}
+```
+
+### Describe the schema
+
+Metadata is declared in Swift with typed `KeyPath`s. Primary keys and indexes are matched to
+queries by key-path identity, so the planner can select an index automatically:
+
+```swift
+import FDBRecordLayer
+
+let meta = RecordMetaData {
+    RecordType(Example_Order.self, primaryKey: \.orderID)
+        .index("price", on: \.price)              // value index
+        .index("customerName", on: \.customer.name)   // nested field
+        .index("byTag", on: \.tags, fanType: .fanOut) // one entry per repeated value
+}
+```
+
+#### Or declare metadata in the `.proto`
+
+Alternatively, annotate fields directly with FoundationDB's options (import the vendored
+`record_metadata_options.proto`), mirroring the Java Record Layer:
+
+```protobuf
+syntax = "proto2";
+import "record_metadata_options.proto";
+
+message Order {
+  optional int64 order_id = 1 [(com.apple.foundationdb.record.field).primary_key = true];
+  optional int64 price    = 2 [(com.apple.foundationdb.record.field).index = { type: "value" }];
+}
+```
+
+Compile a descriptor set and build metadata from it (field values are extracted at runtime by
+field number, so no key paths are needed):
+
+```bash
+protoc --include_imports --descriptor_set_out=schema.desc -I protos Order.proto
+```
+
+```swift
+let data = try Data(contentsOf: URL(fileURLWithPath: "schema.desc"))
+let meta = try RecordMetaData(descriptorSetData: data, recordTypes: [Order.self])
+```
+
+### Save, load, delete
+
+A store operates within an `FDBRecordContext` (a transaction). `withRecordContext` reuses the
+base bindings' retry loop and commits on success:
+
+```swift
+try await database.withRecordContext { context in
+    let store = try await FDBRecordStore.open(
+        context: context, path: KeySpacePath("app"), metaData: meta)
+
+    var order = Example_Order()
+    order.orderID = 1; order.flower = "rose"; order.price = 10; order.tags = ["red"]
+    try await store.save(order)
+
+    let stored = try await store.load(Example_Order.self, Int64(1))
+    print(stored?.record.flower as Any)   // "rose"
+}
+```
+
+### Query
+
+Build a `RecordQuery` with the fluent `Query` API; the planner chooses an index scan or full
+scan, always re-applying the filter as a residual so results are exact:
+
+```swift
+let query = RecordQuery(Example_Order.self)
+    .where(Query.and(
+        Query.field(\.price).lessThan(50),
+        Query.field(\.customer.name).equals("alice")
+    ))
+    .sorted(by: .field(\.price))
+
+try await database.withRecordContext { context in
+    let store = try await FDBRecordStore.open(context: context, path: KeySpacePath("app"), metaData: meta)
+    for try await record in try await store.executeQuery(query) {
+        print(record.record.orderID)
+    }
+}
+```
+
+`Query.any(\.tags).equals("red")` matches a repeated field via a fan-out index (results are
+de-duplicated).
+
+### Advanced indexes
+
+Declare aggregate, rank, and version indexes via the `type:` parameter, and read them with
+dedicated helpers:
+
+```swift
+RecordType(Example_Item.self, primaryKey: \.sku)
+    .index("countByCategory", on: .field(\.category), type: .count)
+    .index("sumQtyByCategory", on: .concat(.field(\.category), .field(\.quantity)), type: .sum)
+RecordType(Example_Order.self, primaryKey: \.orderID)
+    .index("priceRank", on: \.price, type: .rank)
+    .index("version", on: .version(), type: .version)
+```
+
+```swift
+let count = try await store.aggregate(Example_Item.self, indexNamed: "countByCategory", group: Tuple("flower"))
+let belowMedian = try await store.rank(Example_Order.self, indexNamed: "priceRank", lessThan: Int64(50))
+for try await order in try store.scanByVersion(Example_Order.self, indexNamed: "version") { /* commit order */ }
+```
+
+`min`/`max` indexes keep their entries ordered, so the extremum is the first/last entry in a
+group's range — correct even after deletes — read via `store.minimum(...)` / `store.maximum(...)`.
+
+Queries match indexes by field identity across both declaration styles: a `KeyPath` predicate
+resolves to its protobuf field number, so it can select an index that was declared with proto
+annotations (and vice versa).
+
 ## Requirements
 
 - Swift 6.1+
@@ -178,6 +337,27 @@ The `libfdb_c` dynamic library must also be on the dynamic library search path
 at test run time. This is automatic with a standard install. For a custom
 install prefix, add the library directory to the path before running tests by adjusting
 your system path or (on Linux) using the `LD_LIBRARY_PATH` environment variable.
+
+On macOS, `DYLD_*` environment variables are stripped from the system test helper by SIP, so
+if `libfdb_c.dylib` is not on the default loader path you may see
+`Library not loaded: @rpath/libfdb_c.dylib`. Embed an rpath at link time instead:
+
+```bash
+swift test -Xlinker -rpath -Xlinker /usr/local/lib
+```
+
+### Record Layer tests
+
+The Record Layer and its tests are behind the `RecordLayer` trait, so enable it explicitly:
+
+```bash
+swift test --traits RecordLayer -Xlinker -rpath -Xlinker /usr/local/lib
+```
+
+> Integration tests block until the cluster is available (FoundationDB has no default
+> operation timeout). If a run appears to hang, check `fdbcli --exec 'status minimal'`; a
+> freshly installed cluster must be initialized once with
+> `fdbcli --exec 'configure new single ssd'`.
 
 ## Documentation
 

@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package fdb.test;
+
+// A nested message used to exercise nested key expressions.
+message Customer {
+  int64 id = 1;
+  string name = 2;
+  string city = 3;
+}
+
+// The primary record type used across Record Layer tests.
+message Order {
+  int64 order_id = 1;
+  string flower = 2;
+  int64 price = 3;
+  Customer customer = 4;
+  repeated string tags = 5;
+}
+
+// A second record type sharing the store, used for multi-type and aggregate tests.
+message Item {
+  string sku = 1;
+  string name = 2;
+  int64 quantity = 3;
+  string category = 4;
+}
