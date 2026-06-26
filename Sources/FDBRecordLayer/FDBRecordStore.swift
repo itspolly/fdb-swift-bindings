@@ -275,6 +275,23 @@ public final class FDBRecordStore {
         return keys
     }
 
+    /// Removes all data for an index: its entries plus its persisted state and build progress.
+    ///
+    /// Use this when retiring an index from the schema: call `clearIndex` while the index is
+    /// still declared, then drop it from the metadata and never reuse its key. Because each
+    /// index occupies its own key subspace, clearing one never affects another.
+    public func clearIndex(named name: String) async throws {
+        guard let recordType = metaData.recordType(forIndexNamed: name),
+              let index = recordType.indexes.first(where: { $0.name == name }) else {
+            throw RecordStoreError.unknownIndex(name)
+        }
+        let (begin, end) = indexesSubspace.child(Int64(index.subspaceKey)).range
+        transaction.clearRange(beginKey: begin, endKey: end)
+        transaction.clear(key: indexStateKey(name))
+        transaction.clear(key: buildProgressKey(name))
+        indexStates.removeValue(forKey: name)
+    }
+
     // MARK: - Index building
 
     /// Backfills one batch of existing records into the named index within this transaction,

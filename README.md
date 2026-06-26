@@ -271,6 +271,25 @@ transactions, resumable) to make it `readable`:
 try await database.buildIndex(subspace: subspace, metaData: meta, indexName: "priceIdx")
 ```
 
+### Stable keys and schema evolution
+
+Record types and indexes occupy storage by an integer key. Give them **explicit, stable keys**
+so the on-disk layout is independent of declaration order — then you can reorder declarations,
+and add or remove entries, freely (treat keys like protobuf field numbers: never reuse a retired
+one). Without explicit keys, keys are positional, so a keyless schema must only ever be
+*appended* to.
+
+```swift
+RecordMetaData {
+    RecordType(Order.self, key: 1, primaryKey: \.orderId)
+        .index("price", on: \.price, key: 10)
+    RecordType(Customer.self, key: 2, primaryKey: \.id)
+}
+```
+
+To retire an index: `try await store.clearIndex(named: "price")` (wipes its data), then drop it
+from the schema and never reuse its key. Clearing one index never affects another.
+
 ### Paging
 
 Set a `limit` and page with an opaque continuation token (stateless — safe to hand to an API

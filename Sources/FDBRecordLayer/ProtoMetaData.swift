@@ -45,6 +45,11 @@ extension RecordMetaData {
     /// - Parameters:
     ///   - descriptorSetData: the serialized `FileDescriptorSet` bytes.
     ///   - recordTypes: the generated message types to register (matched by message name).
+    ///
+    /// - Note: record types and indexes built this way currently take **positional** storage
+    ///   keys (by the order of `recordTypes` and of fields in the descriptor), so that order
+    ///   must stay stable for an existing store — append only, like the keyless Swift DSL.
+    ///   Use the Swift DSL with explicit `key:` values when you need order-independent evolution.
     public init(
         version: Int = 1,
         descriptorSetData: Data,
@@ -173,6 +178,7 @@ private func makeErasedRecordType(
         return ErasedRecordType(
             recordName: M.protoMessageName,
             typeKey: -1,
+            explicitKey: nil,
             primaryKeyColumns: { message in
                 primaryKeyFields.map { extractFieldValues(message, fieldNumber: $0).first ?? NullValue() }
             },
@@ -183,6 +189,7 @@ private func makeErasedRecordType(
                     name: info.name,
                     type: info.type,
                     subspaceKey: -1,
+                    explicitKey: nil,
                     producesMultipleKeys: info.repeated,
                     columnIdentities: [.fieldPath(info.path)],
                     entries: { message in

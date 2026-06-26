@@ -61,11 +61,16 @@ public struct Index<M: SwiftProtobuf.Message>: Sendable {
     public let type: IndexType
     /// Computes the index entries for a record.
     public let expression: KeyExpression<M>
+    /// An explicit, stable key for the index's storage location. When provided, the on-disk
+    /// layout is independent of declaration order; when `nil`, a positional key is assigned.
+    /// Treat keys like protobuf field numbers: never reuse a retired one.
+    public let key: Int?
 
-    public init(_ name: String, _ expression: KeyExpression<M>, type: IndexType = .value) {
+    public init(_ name: String, _ expression: KeyExpression<M>, type: IndexType = .value, key: Int? = nil) {
         self.name = name
         self.type = type
         self.expression = expression
+        self.key = key
     }
 }
 #endif

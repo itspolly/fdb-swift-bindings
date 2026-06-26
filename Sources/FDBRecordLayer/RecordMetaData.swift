@@ -50,17 +50,22 @@ public struct RecordType<M: SwiftProtobuf.Message>: ErasableRecordType, Sendable
     public let primaryKey: KeyExpression<M>
     /// The secondary indexes declared on this record type.
     public private(set) var indexes: [Index<M>]
+    /// An explicit, stable key prefixing this type's records. When provided, the on-disk layout
+    /// is independent of declaration order; when `nil`, a positional key is assigned. Treat keys
+    /// like protobuf field numbers: never reuse a retired one.
+    public let key: Int?
 
     /// Creates a record type with an explicit primary-key expression.
-    public init(_ type: M.Type, primaryKey: KeyExpression<M>) {
+    public init(_ type: M.Type, key: Int? = nil, primaryKey: KeyExpression<M>) {
         self.recordName = M.protoMessageName
         self.primaryKey = primaryKey
         self.indexes = []
+        self.key = key
     }
 
     /// Creates a record type with a single-field primary key.
-    public init<V: IndexableValue>(_ type: M.Type, primaryKey keyPath: KeyPath<M, V> & Sendable) {
-        self.init(type, primaryKey: .field(keyPath))
+    public init<V: IndexableValue>(_ type: M.Type, key: Int? = nil, primaryKey keyPath: KeyPath<M, V> & Sendable) {
+        self.init(type, key: key, primaryKey: .field(keyPath))
     }
 
     // Composite primary keys use `init(_:primaryKey:)` with `.concat(...)`.
@@ -68,24 +73,25 @@ public struct RecordType<M: SwiftProtobuf.Message>: ErasableRecordType, Sendable
     // MARK: Index builders (chainable)
 
     /// Adds an index built from an arbitrary key expression.
-    public func index(_ name: String, on expression: KeyExpression<M>, type: IndexType = .value) -> RecordType<M> {
+    public func index(_ name: String, on expression: KeyExpression<M>, type: IndexType = .value, key: Int? = nil) -> RecordType<M> {
         var copy = self
-        copy.indexes.append(Index(name, expression, type: type))
+        copy.indexes.append(Index(name, expression, type: type, key: key))
         return copy
     }
 
     /// Adds a single-field (possibly nested) value index.
     public func index<V: IndexableValue>(
-        _ name: String, on keyPath: KeyPath<M, V> & Sendable, type: IndexType = .value
+        _ name: String, on keyPath: KeyPath<M, V> & Sendable, type: IndexType = .value, key: Int? = nil
     ) -> RecordType<M> {
-        index(name, on: .field(keyPath), type: type)
+        index(name, on: .field(keyPath), type: type, key: key)
     }
 
     /// Adds an index over a repeated field.
     public func index<V: IndexableValue>(
-        _ name: String, on keyPath: KeyPath<M, [V]> & Sendable, fanType: FanType = .fanOut, type: IndexType = .value
+        _ name: String, on keyPath: KeyPath<M, [V]> & Sendable, fanType: FanType = .fanOut,
+        type: IndexType = .value, key: Int? = nil
     ) -> RecordType<M> {
-        index(name, on: .field(keyPath, fanType), type: type)
+        index(name, on: .field(keyPath, fanType), type: type, key: key)
     }
 
     func _erase() -> ErasedRecordType {
@@ -95,6 +101,7 @@ public struct RecordType<M: SwiftProtobuf.Message>: ErasableRecordType, Sendable
                 name: idx.name,
                 type: idx.type,
                 subspaceKey: -1,
+                explicitKey: idx.key,
                 producesMultipleKeys: idx.expression.producesMultipleKeys,
                 columnIdentities: idx.expression.columnIdentities,
                 entries: { message in idx.expression.evaluate(message as! M) }
@@ -103,6 +110,7 @@ public struct RecordType<M: SwiftProtobuf.Message>: ErasableRecordType, Sendable
         return ErasedRecordType(
             recordName: recordName,
             typeKey: -1,
+            explicitKey: key,
             primaryKeyColumns: { message in pk.evaluate(message as! M).first ?? [] },
             primaryKeyIdentities: pk.columnIdentities,
             deserialize: { bytes in try M(serializedBytes: bytes) },
@@ -119,6 +127,8 @@ struct ErasedIndex: Sendable {
     let type: IndexType
     /// Assigned by ``RecordMetaData`` to give the index its own key subspace.
     var subspaceKey: Int
+    /// Caller-supplied stable key, if any (otherwise positional).
+    let explicitKey: Int?
     let producesMultipleKeys: Bool
     let columnIdentities: [FieldID?]
     /// Computes the index entries (columns, before the primary key) for a record.
@@ -130,6 +140,8 @@ struct ErasedRecordType: Sendable {
     let recordName: String
     /// Assigned by ``RecordMetaData``; prefixes every record key of this type.
     var typeKey: Int
+    /// Caller-supplied stable key, if any (otherwise positional).
+    let explicitKey: Int?
     let primaryKeyColumns: @Sendable (any SwiftProtobuf.Message) -> [any TupleElement]
     let primaryKeyIdentities: [FieldID?]
     let deserialize: @Sendable ([UInt8]) throws -> any SwiftProtobuf.Message
@@ -189,12 +201,36 @@ public struct RecordMetaData: Sendable {
     /// Shared by the Swift DSL and the proto-annotation paths.
     init(version: Int, erasedTypes: [ErasedRecordType]) {
         var erased = erasedTypes
+
+        // Resolve each record type's and index's storage key: use the explicit key when given,
+        // otherwise fill the next free position. Explicit keys make the layout independent of
+        // declaration order; positional keys preserve the original behavior for keyless schemas.
+        var usedTypeKeys = Set(erased.compactMap { $0.explicitKey })
+        precondition(usedTypeKeys.count == erased.compactMap { $0.explicitKey }.count,
+                     "Duplicate explicit record-type keys in RecordMetaData")
+        let allIndexExplicitKeys = erased.flatMap { $0.indexes.compactMap { $0.explicitKey } }
+        var usedIndexKeys = Set(allIndexExplicitKeys)
+        precondition(usedIndexKeys.count == allIndexExplicitKeys.count,
+                     "Duplicate explicit index keys in RecordMetaData")
+
+        var nextTypeKey = 0
         var nextIndexKey = 0
         for typeIndex in erased.indices {
-            erased[typeIndex].typeKey = typeIndex
+            if let key = erased[typeIndex].explicitKey {
+                erased[typeIndex].typeKey = key
+            } else {
+                while usedTypeKeys.contains(nextTypeKey) { nextTypeKey += 1 }
+                erased[typeIndex].typeKey = nextTypeKey
+                usedTypeKeys.insert(nextTypeKey)
+            }
             for indexIndex in erased[typeIndex].indexes.indices {
-                erased[typeIndex].indexes[indexIndex].subspaceKey = nextIndexKey
-                nextIndexKey += 1
+                if let key = erased[typeIndex].indexes[indexIndex].explicitKey {
+                    erased[typeIndex].indexes[indexIndex].subspaceKey = key
+                } else {
+                    while usedIndexKeys.contains(nextIndexKey) { nextIndexKey += 1 }
+                    erased[typeIndex].indexes[indexIndex].subspaceKey = nextIndexKey
+                    usedIndexKeys.insert(nextIndexKey)
+                }
             }
         }
         self.version = version
