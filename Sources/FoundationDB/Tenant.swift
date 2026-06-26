@@ -34,15 +34,20 @@ public final class FDBTenant: @unchecked Sendable {
     /// The underlying FoundationDB tenant pointer (thread-safe to use concurrently).
     private let tenant: OpaquePointer
 
-    init(tenant: OpaquePointer) {
+    /// An optional authorization token (e.g. a JWT) attached to every transaction this tenant
+    /// creates, so tenant-aware requests are authorized under `required` tenant mode.
+    private let authorizationToken: FDB.Bytes?
+
+    init(tenant: OpaquePointer, authorizationToken: FDB.Bytes? = nil) {
         self.tenant = tenant
+        self.authorizationToken = authorizationToken
     }
 
     deinit {
         fdb_tenant_destroy(tenant)
     }
 
-    /// Creates a new transaction scoped to this tenant.
+    /// Creates a new transaction scoped to this tenant (carrying the authorization token, if any).
     public func createTransaction() throws -> FDBTransaction {
         var transaction: OpaquePointer?
         let error = fdb_tenant_create_transaction(tenant, &transaction)
@@ -52,7 +57,11 @@ public final class FDBTenant: @unchecked Sendable {
         guard let tr = transaction else {
             throw FDBError(.internalError)
         }
-        return FDBTransaction(transaction: tr)
+        let wrapped = FDBTransaction(transaction: tr)
+        if let authorizationToken {
+            try wrapped.setOption(to: authorizationToken, forOption: .authorizationToken)
+        }
+        return wrapped
     }
 
     /// Executes `operation` in a tenant-scoped transaction, retrying on retryable errors and

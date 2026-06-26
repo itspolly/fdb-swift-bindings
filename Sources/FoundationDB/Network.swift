@@ -53,8 +53,11 @@ final class FDBNetwork: Sendable {
     /// - Throws: `FDBError` if any step of initialization fails.
     func initialize(version: Int) throws {
         try networkThread.withLock { networkThread in
+            // Initialization is process-wide and may happen only once; calling it again (or
+            // concurrently) is a no-op rather than an error. The mutex serializes racing
+            // callers, so `selectAPIVersion` runs exactly once.
             if networkThread != nil {
-                throw FDBError(.networkError)
+                return
             }
 
             try selectAPIVersion(Int32(version))

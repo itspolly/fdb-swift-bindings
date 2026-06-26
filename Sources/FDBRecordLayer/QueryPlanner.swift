@@ -71,14 +71,20 @@ struct QueryPlan {
 /// always re-applied as a residual during execution, so a plan only needs to produce a
 /// superset — except where ``isFullyCovered(_:by:)`` proves no residual is needed.
 enum QueryPlanner {
-    static func plan(recordType: ErasedRecordType, node: PredicateNode?) -> QueryPlan {
+    /// Plans `node` over `recordType`. `readableIndexNames` restricts which indexes the planner
+    /// may use (a `writeOnly`/building index is invisible); `nil` means all are usable.
+    static func plan(
+        recordType: ErasedRecordType, node: PredicateNode?, readableIndexNames: Set<String>? = nil
+    ) -> QueryPlan {
         guard let node else { return QueryPlan(source: .fullScan, requiresDistinct: false) }
 
         // OR: union of index scans, but only if *every* branch can use an index.
         if case .or(let children) = node {
             var scans: [IndexScan] = []
             for child in children {
-                guard let scan = matchIndexScan(recordType: recordType, atoms: child.conjunctionAtoms) else {
+                guard let scan = matchIndexScan(
+                    recordType: recordType, atoms: child.conjunctionAtoms, readableIndexNames: readableIndexNames
+                ) else {
                     return QueryPlan(source: .fullScan, requiresDistinct: false)
                 }
                 scans.append(scan)
@@ -87,16 +93,21 @@ enum QueryPlanner {
             return QueryPlan(source: .union(scans), requiresDistinct: true)
         }
 
-        if let scan = matchIndexScan(recordType: recordType, atoms: node.conjunctionAtoms) {
+        if let scan = matchIndexScan(
+            recordType: recordType, atoms: node.conjunctionAtoms, readableIndexNames: readableIndexNames
+        ) {
             return QueryPlan(source: .indexScan(scan), requiresDistinct: scan.index.producesMultipleKeys)
         }
         return QueryPlan(source: .fullScan, requiresDistinct: false)
     }
 
     /// The best index scan for a conjunction of comparisons, or `nil` if none apply.
-    static func matchIndexScan(recordType: ErasedRecordType, atoms: [IndexableAtom]) -> IndexScan? {
+    static func matchIndexScan(
+        recordType: ErasedRecordType, atoms: [IndexableAtom], readableIndexNames: Set<String>? = nil
+    ) -> IndexScan? {
         var best: IndexScan?
         for index in recordType.indexes where index.type == .value {
+            if let readableIndexNames, !readableIndexNames.contains(index.name) { continue }
             guard let scan = scan(index: index, atoms: atoms) else { continue }
             if isBetter(scan, than: best) { best = scan }
         }

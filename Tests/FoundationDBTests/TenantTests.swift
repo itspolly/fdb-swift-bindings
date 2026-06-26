@@ -93,4 +93,38 @@ struct TenantTests {
         try await db.deleteTenant(name: nameA)
         try await db.deleteTenant(name: nameB)
     }
+
+    @Test("tenantInfo and listTenantsInfo parse id and prefix")
+    func metadata() async throws {
+        let db = try await database()
+        let name = uniqueName()
+        try await db.createTenant(name: name)
+
+        let info = try await db.tenantInfo(name: name)
+        #expect(info != nil)
+        #expect((info?.id ?? -1) >= 0)
+        #expect(!(info?.prefix.isEmpty ?? true))
+
+        let listed = try await db.listTenantsInfo(limit: 10_000)
+        #expect(listed.contains { String(decoding: $0.name, as: UTF8.self) == name && $0.id == info?.id })
+
+        try await db.deleteTenant(name: name)
+        let after = try await db.tenantInfo(name: name)
+        #expect(after == nil)
+    }
+
+    @Test("a tenant opened with an authorization token creates transactions without error")
+    func authorizationToken() async throws {
+        let db = try await database()
+        let name = uniqueName()
+        try await db.createTenant(name: name)
+
+        // A non-JWT token still attaches as a local transaction option; we assert the handle
+        // creates transactions (the option is applied) — full token auth needs a configured cluster.
+        let tenant = try db.openTenant(name: name, authorizationToken: [UInt8]("test-token".utf8))
+        let transaction = try tenant.createTransaction()
+        transaction.cancel()
+
+        try await db.deleteTenant(name: name)
+    }
 }

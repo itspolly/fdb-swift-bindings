@@ -78,7 +78,7 @@ public final class FDBDatabase: DatabaseProtocol, @unchecked Sendable {
     /// - Parameter name: The tenant's name.
     /// - Returns: An ``FDBTenant`` handle.
     /// - Throws: `FDBError` if the tenant cannot be opened.
-    public func openTenant(name: FDB.Bytes) throws -> FDBTenant {
+    public func openTenant(name: FDB.Bytes, authorizationToken: FDB.Bytes? = nil) throws -> FDBTenant {
         var tenant: OpaquePointer?
         let error = name.withUnsafeBytes { bytes in
             fdb_database_open_tenant(
@@ -94,12 +94,12 @@ public final class FDBDatabase: DatabaseProtocol, @unchecked Sendable {
         guard let openedTenant = tenant else {
             throw FDBError(.internalError)
         }
-        return FDBTenant(tenant: openedTenant)
+        return FDBTenant(tenant: openedTenant, authorizationToken: authorizationToken)
     }
 
     /// Opens an existing tenant by name string.
-    public func openTenant(name: String) throws -> FDBTenant {
-        try openTenant(name: Array(name.utf8))
+    public func openTenant(name: String, authorizationToken: FDB.Bytes? = nil) throws -> FDBTenant {
+        try openTenant(name: Array(name.utf8), authorizationToken: authorizationToken)
     }
 
     /// Sets a database option with a byte array value.

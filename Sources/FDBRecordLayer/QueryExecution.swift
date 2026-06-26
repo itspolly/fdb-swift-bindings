@@ -29,6 +29,13 @@ public struct CoveredRecord: Sendable {
     public let columns: [any TupleElement]
 }
 
+/// One page of a paged query: the records plus an opaque continuation token. A `nil`
+/// continuation means the result set is exhausted.
+public struct QueryPage<M: SwiftProtobuf.Message & Sendable>: Sendable {
+    public let records: [FDBStoredRecord<M>]
+    public let continuation: FDB.Bytes?
+}
+
 extension FDBRecordStore {
     /// Executes `query`, returning a cursor over the matching records.
     ///
@@ -42,7 +49,9 @@ extension FDBRecordStore {
             throw RecordStoreError.unknownRecordType(M.protoMessageName)
         }
 
-        let plan = QueryPlanner.plan(recordType: recordType, node: query.filter?.node)
+        let plan = QueryPlanner.plan(
+            recordType: recordType, node: query.filter?.node,
+            readableIndexNames: readableIndexNames(for: recordType))
         let needsDistinct = query.requiresDistinct || plan.requiresDistinct
         let filter = query.filter
 
@@ -85,7 +94,8 @@ extension FDBRecordStore {
             return total
         }
 
-        let plan = QueryPlanner.plan(recordType: recordType, node: node)
+        let plan = QueryPlanner.plan(
+            recordType: recordType, node: node, readableIndexNames: readableIndexNames(for: recordType))
         switch plan.source {
         case .indexScan(let scan) where QueryPlanner.isFullyCovered(node, by: scan):
             return try await collectPrimaryKeys([scan], recordType: recordType, distinct: true).count
@@ -109,7 +119,8 @@ extension FDBRecordStore {
         }
         let index = try erasedIndex(M.self, named: indexName)
         let node = query.filter?.node ?? .and([])
-        guard index.type == .value || index.type == .rank,
+        guard indexState(named: indexName) == .readable,
+              index.type == .value || index.type == .rank,
               let scan = QueryPlanner.scan(index: index, atoms: node.conjunctionAtoms),
               QueryPlanner.isFullyCovered(node, by: scan)
         else {
@@ -131,6 +142,113 @@ extension FDBRecordStore {
             result.append(CoveredRecord(primaryKey: primaryKey, columns: columns))
         }
         return result
+    }
+
+    // MARK: - Paged execution
+
+    /// Executes one page of `query`, resuming from `continuation` (pass `nil` for the first
+    /// page). Set `query.limit` to bound the page size; the returned `continuation` is `nil`
+    /// once results are exhausted. Streaming plans resume efficiently by key; sorted and
+    /// `OR`-union plans page over the materialized result set by offset.
+    public func executeQuery<M: SwiftProtobuf.Message & Sendable>(
+        _ query: RecordQuery<M>, continuation: FDB.Bytes?
+    ) async throws -> QueryPage<M> {
+        guard let recordType = metaData.recordType(for: M.self) else {
+            throw RecordStoreError.unknownRecordType(M.protoMessageName)
+        }
+        guard let limit = query.limit else {
+            return QueryPage(records: try await executeQuery(query).collect(), continuation: nil)
+        }
+
+        let plan = QueryPlanner.plan(
+            recordType: recordType, node: query.filter?.node,
+            readableIndexNames: readableIndexNames(for: recordType))
+
+        // Sorted or union plans page over the materialized, ordered/de-duplicated result.
+        if query.sort != nil {
+            return try await offsetPage(query, limit: limit, continuation: continuation)
+        }
+        switch plan.source {
+        case .union:
+            return try await offsetPage(query, limit: limit, continuation: continuation)
+        case .fullScan:
+            let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
+            return try await keyBasedPage(
+                range: typeSubspace.range, prefixLength: typeSubspace.prefix.count,
+                isIndexScan: false, recordType: recordType, filter: query.filter,
+                limit: limit, continuation: continuation)
+        case .indexScan(let scan):
+            let indexSubspace = indexesSubspace.child(Int64(scan.index.subspaceKey))
+            return try await keyBasedPage(
+                range: Self.indexRange(indexSubspace, scan), prefixLength: indexSubspace.prefix.count,
+                isIndexScan: true, recordType: recordType, filter: query.filter,
+                limit: limit, continuation: continuation)
+        }
+    }
+
+    /// Offset-based paging: re-materialize the ordered result and slice it.
+    private func offsetPage<M: SwiftProtobuf.Message & Sendable>(
+        _ query: RecordQuery<M>, limit: Int, continuation: FDB.Bytes?
+    ) async throws -> QueryPage<M> {
+        let offset = continuation.flatMap(Self.decodeOffset) ?? 0
+        let all = try await executeQuery(query).collect()
+        guard offset < all.count else { return QueryPage(records: [], continuation: nil) }
+        let endIndex = Swift.min(offset + limit, all.count)
+        let next = endIndex < all.count ? Self.encodeOffset(endIndex) : nil
+        return QueryPage(records: Array(all[offset..<endIndex]), continuation: next)
+    }
+
+    /// Key-based paging for a streaming plan: resume the KV scan after the continuation key,
+    /// collect up to `limit` post-filter records, and emit the last key as the continuation.
+    private func keyBasedPage<M: SwiftProtobuf.Message & Sendable>(
+        range: (begin: FDB.Bytes, end: FDB.Bytes), prefixLength: Int, isIndexScan: Bool,
+        recordType: ErasedRecordType, filter: QueryComponent<M>?, limit: Int, continuation: FDB.Bytes?
+    ) async throws -> QueryPage<M> {
+        let begin = Self.decodeKey(continuation).map { $0 + [0x00] } ?? range.begin
+        let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
+        let primaryKeyCount = recordType.primaryKeyIdentities.count
+        let name = recordType.recordName
+
+        var records: [FDBStoredRecord<M>] = []
+        var lastScanKey: FDB.Bytes?
+        var iterator = transaction.getRange(beginKey: begin, endKey: range.end).makeAsyncIterator()
+        while records.count < limit, let (key, value) = try await iterator.next() {
+            let record: FDBStoredRecord<M>?
+            if isIndexScan {
+                let elements = try Tuple.decode(from: Array(key.dropFirst(prefixLength)))
+                guard elements.count >= primaryKeyCount else { continue }
+                let primaryKey = Tuple(Array(elements.suffix(primaryKeyCount)))
+                guard let bytes = try await transaction.getValue(
+                    for: typeSubspace.prefix + primaryKey.encode()) else { continue }
+                let message = try M(serializedBytes: bytes)
+                record = (filter?.eval(message) ?? true)
+                    ? FDBStoredRecord(recordType: name, primaryKey: primaryKey, record: message) : nil
+            } else {
+                let primaryKey = Tuple(try Tuple.decode(from: Array(key.dropFirst(prefixLength))))
+                let message = try M(serializedBytes: value)
+                record = (filter?.eval(message) ?? true)
+                    ? FDBStoredRecord(recordType: name, primaryKey: primaryKey, record: message) : nil
+            }
+            if let record {
+                records.append(record)
+                lastScanKey = key
+            }
+        }
+        let next = records.count == limit ? lastScanKey.map(Self.encodeKey) : nil
+        return QueryPage(records: records, continuation: next)
+    }
+
+    // Continuation token codec: tag byte 0x01 = scan key, 0x02 = offset.
+    private static func encodeKey(_ key: FDB.Bytes) -> FDB.Bytes { [0x01] + key }
+    private static func decodeKey(_ token: FDB.Bytes?) -> FDB.Bytes? {
+        guard let token, token.first == 0x01 else { return nil }
+        return Array(token.dropFirst())
+    }
+    private static func encodeOffset(_ offset: Int) -> FDB.Bytes { [0x02] + Tuple(Int64(offset)).encode() }
+    private static func decodeOffset(_ token: FDB.Bytes) -> Int? {
+        guard token.first == 0x02,
+              let value = (try? Tuple.decode(from: Array(token.dropFirst())))?.first as? Int64 else { return nil }
+        return Int(value)
     }
 
     // MARK: - Primary-key collection

@@ -63,8 +63,23 @@ public final class FDBRecordStore {
 
     var transaction: any TransactionProtocol { context.transaction }
 
+    /// Per-index build state, resolved when the store is opened.
+    private var indexStates: [String: IndexState] = [:]
+
     private var formatVersionKey: FDB.Bytes { storeInfoSubspace.pack("format_version") }
     private var metaDataVersionKey: FDB.Bytes { storeInfoSubspace.pack("metadata_version") }
+    private func indexStateKey(_ name: String) -> FDB.Bytes { storeInfoSubspace.pack("index_state", name) }
+    private func buildProgressKey(_ name: String) -> FDB.Bytes { storeInfoSubspace.pack("index_build", name) }
+
+    /// The build state of the named index (defaults to `.readable` for unknown names).
+    public func indexState(named name: String) -> IndexState {
+        indexStates[name] ?? .readable
+    }
+
+    /// The names of indexes currently usable by queries (readable).
+    func readableIndexNames(for recordType: ErasedRecordType) -> Set<String> {
+        Set(recordType.indexes.map { $0.name }.filter { indexState(named: $0) == .readable })
+    }
 
     init(context: FDBRecordContext, subspace: Subspace, metaData: RecordMetaData) {
         self.context = context
@@ -109,6 +124,29 @@ public final class FDBRecordStore {
             transaction.setValue(Self.encodeInt(recordLayerFormatVersion), for: formatVersionKey)
             transaction.setValue(Self.encodeInt(metaData.version), for: metaDataVersionKey)
         }
+        try await resolveIndexStates()
+    }
+
+    /// Loads each index's persisted state, or resolves a new index: `readable` when its record
+    /// type is empty (nothing to backfill), otherwise `writeOnly` (maintained on writes, hidden
+    /// from queries until built).
+    private func resolveIndexStates() async throws {
+        for recordType in metaData.recordTypes {
+            for index in recordType.indexes {
+                if let stored = try await transaction.getValue(for: indexStateKey(index.name)),
+                   let raw = Self.decodeInt(stored), let state = IndexState(rawValue: Int(raw)) {
+                    indexStates[index.name] = state
+                    continue
+                }
+                let (begin, end) = recordsSubspace.child(Int64(recordType.typeKey)).range
+                let firstBatch = try await transaction.getRangeNative(
+                    beginSelector: .firstGreaterOrEqual(begin), endSelector: .firstGreaterOrEqual(end),
+                    limit: 1, snapshot: false)
+                let state: IndexState = firstBatch.records.isEmpty ? .readable : .writeOnly
+                transaction.setValue(Self.encodeInt(state.rawValue), for: indexStateKey(index.name))
+                indexStates[index.name] = state
+            }
+        }
     }
 
     // MARK: - Save / load / delete
@@ -133,7 +171,7 @@ public final class FDBRecordStore {
         let serialized: [UInt8] = try record.serializedBytes()
         transaction.setValue(serialized, for: recordKey)
 
-        for index in recordType.indexes {
+        for index in recordType.indexes where indexState(named: index.name) != .disabled {
             let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
             let oldEntries = oldMessage.map { index.entries($0) } ?? []
             let newEntries = index.entries(record)
@@ -184,7 +222,7 @@ public final class FDBRecordStore {
         transaction.clear(key: recordKey)
 
         let primaryKeyEncoded = primaryKey.encode()
-        for index in recordType.indexes {
+        for index in recordType.indexes where indexState(named: index.name) != .disabled {
             let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
             try await indexMaintainer(for: index.type).update(
                 transaction: transaction,
@@ -237,6 +275,55 @@ public final class FDBRecordStore {
         return keys
     }
 
+    // MARK: - Index building
+
+    /// Backfills one batch of existing records into the named index within this transaction,
+    /// resuming from persisted progress. Returns `true` when the build is complete (state has
+    /// been flipped to `readable`). Drive it across transactions via
+    /// ``FoundationDB/DatabaseProtocol/buildIndex(subspace:metaData:indexName:batchSize:)``.
+    func backfillIndex(named name: String, batchSize: Int) async throws -> Bool {
+        guard let recordType = metaData.recordType(forIndexNamed: name),
+              let index = recordType.indexes.first(where: { $0.name == name }) else {
+            throw RecordStoreError.unknownIndex(name)
+        }
+        let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
+        let progress = try await transaction.getValue(for: buildProgressKey(name))
+        let begin = progress.map { typeSubspace.prefix + $0 + [0x00] } ?? typeSubspace.range.begin
+        let end = typeSubspace.range.end
+
+        let batch = try await transaction.getRangeNative(
+            beginSelector: .firstGreaterOrEqual(begin), endSelector: .firstGreaterOrEqual(end),
+            limit: batchSize, snapshot: false)
+
+        let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
+        let maintainer = try indexMaintainer(for: index.type)
+        var lastPrimaryKeyEncoded: FDB.Bytes?
+        for (key, value) in batch.records {
+            let primaryKeyEncoded = Array(key.dropFirst(typeSubspace.prefix.count))
+            let message = try recordType.deserialize(value)
+            try await maintainer.update(
+                transaction: transaction,
+                indexSubspace: indexSubspace,
+                oldEntries: [],
+                newEntries: index.entries(message),
+                primaryKeyEncoded: primaryKeyEncoded
+            )
+            lastPrimaryKeyEncoded = primaryKeyEncoded
+        }
+        if let lastPrimaryKeyEncoded {
+            transaction.setValue(lastPrimaryKeyEncoded, for: buildProgressKey(name))
+        }
+
+        if batch.more {
+            return false
+        }
+        // Done: the index is now fully populated and usable by queries.
+        transaction.setValue(Self.encodeInt(IndexState.readable.rawValue), for: indexStateKey(name))
+        transaction.clear(key: buildProgressKey(name))
+        indexStates[name] = .readable
+        return true
+    }
+
     // MARK: - Internals
 
     func indexMaintainer(for type: IndexType) throws -> any IndexMaintainer {
@@ -270,7 +357,11 @@ public final class FDBRecordStore {
     }
 
     static func decodeInt(_ bytes: FDB.Bytes) -> Int64? {
-        (try? Tuple.decode(from: bytes))?.first as? Int64
+        // Tuple decoding yields `Int` for the zero value but `Int64` otherwise; accept both.
+        guard let first = (try? Tuple.decode(from: bytes))?.first else { return nil }
+        if let value = first as? Int64 { return value }
+        if let value = first as? Int { return Int64(value) }
+        return nil
     }
 }
 #endif

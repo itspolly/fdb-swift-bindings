@@ -221,5 +221,10 @@ public struct RecordMetaData: Sendable {
         guard let index = indexByName[name] else { return nil }
         return recordTypes[index]
     }
+
+    /// Looks up the erased record type that declares the index named `indexName`.
+    func recordType(forIndexNamed indexName: String) -> ErasedRecordType? {
+        recordTypes.first { $0.indexes.contains { $0.name == indexName } }
+    }
 }
 #endif

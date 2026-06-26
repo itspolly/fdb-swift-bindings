@@ -39,14 +39,15 @@ public enum IndexType: Sendable, Hashable {
     case rank
 }
 
-/// Whether an index participates in reads and/or writes.
-public enum IndexState: Sendable, Hashable {
+/// Whether an index participates in reads and/or writes. The raw value is persisted in the
+/// store header.
+public enum IndexState: Int, Sendable, Hashable {
     /// Fully built and usable by queries.
-    case readable
+    case readable = 0
     /// Maintained on writes but not yet usable by queries (e.g. while building).
-    case writeOnly
+    case writeOnly = 1
     /// Not maintained at all.
-    case disabled
+    case disabled = 2
 }
 
 /// A secondary index over records of type `M`.

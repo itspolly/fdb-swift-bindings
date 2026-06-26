@@ -44,19 +44,23 @@ public struct RecordQuery<M: SwiftProtobuf.Message & Sendable>: Sendable {
     /// Whether duplicate records (by primary key) must be removed — required after a
     /// fan-out index scan can surface the same record more than once.
     public var requiresDistinct: Bool
+    /// Maximum records per page when using paged execution (`executeQuery(_:continuation:)`).
+    public var limit: Int?
 
     public init(
         _ recordType: M.Type,
         filter: QueryComponent<M>? = nil,
         sort: KeyExpression<M>? = nil,
         sortReversed: Bool = false,
-        requiresDistinct: Bool = false
+        requiresDistinct: Bool = false,
+        limit: Int? = nil
     ) {
         self.recordType = recordType
         self.filter = filter
         self.sort = sort
         self.sortReversed = sortReversed
         self.requiresDistinct = requiresDistinct
+        self.limit = limit
     }
 
     /// Returns a copy with the given filter.
@@ -78,6 +82,13 @@ public struct RecordQuery<M: SwiftProtobuf.Message & Sendable>: Sendable {
     public func distinct() -> RecordQuery<M> {
         var copy = self
         copy.requiresDistinct = true
+        return copy
+    }
+
+    /// Returns a copy with a per-page limit (used by paged execution).
+    public func limited(to limit: Int) -> RecordQuery<M> {
+        var copy = self
+        copy.limit = limit
         return copy
     }
 }

@@ -101,6 +101,15 @@ let names = try await database.listTenants()
 try await database.deleteTenant(name: "tenant-a")  // tenant must be empty
 ```
 
+Tenant metadata can be read with `database.tenantInfo(name:)` / `listTenantsInfo()`, which parse
+the tenant map into `TenantInfo` (id + key prefix). For hard multi-tenancy under
+`required_experimental` mode, attach an authorization token (e.g. a JWT) so a tenant's
+transactions are authorized:
+
+```swift
+let tenant = try database.openTenant(name: "tenant-a", authorizationToken: jwtBytes)
+```
+
 Tenant transactions are ordinary `FDBTransaction`s, so they work with everything above —
 including `Subspace` and the Record Layer (`tenant.withRecordContext { … }`).
 
@@ -250,6 +259,30 @@ let entries = try await store.executeCoveringQuery(
 
 // count() tallies matches by scanning index ranges only when the filter is fully covered.
 let n = try await store.count(RecordQuery(Order.self).where(Query.field(\.price).lessThan(50)))
+```
+
+### Adding an index to a populated store
+
+A new index on a store that already has records opens in the `writeOnly` state — maintained on
+writes but hidden from queries — until it is backfilled. Build it online (in batches, across
+transactions, resumable) to make it `readable`:
+
+```swift
+try await database.buildIndex(subspace: subspace, metaData: meta, indexName: "priceIdx")
+```
+
+### Paging
+
+Set a `limit` and page with an opaque continuation token (stateless — safe to hand to an API
+client and resume later):
+
+```swift
+var continuation: [UInt8]? = nil
+repeat {
+    let page = try await store.executeQuery(query.limited(to: 100), continuation: continuation)
+    handle(page.records)
+    continuation = page.continuation
+} while continuation != nil
 ```
 
 ### Advanced indexes

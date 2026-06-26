@@ -108,6 +108,17 @@ struct QueryPlannerTests {
         #expect(plan.unionIndexNames == nil)
     }
 
+    @Test("planner ignores indexes outside the readable set")
+    func readableFilter() {
+        let recordType = meta.recordType(for: Fdb_Test_Order.self)!
+        let node = Query.field(\Fdb_Test_Order.price).equals(10).node
+        let excluded = QueryPlanner.plan(recordType: recordType, node: node, readableIndexNames: [])
+        #expect(excluded.indexName == nil)
+        let included = QueryPlanner.plan(
+            recordType: recordType, node: node, readableIndexNames: ["order.price"])
+        #expect(included.indexName == "order.price")
+    }
+
     @Test("coverage detection: a single equality is covered, an extra residual is not")
     func coverage() throws {
         let recordType = meta.recordType(for: Fdb_Test_Order.self)!
