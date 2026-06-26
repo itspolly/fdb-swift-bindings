@@ -250,6 +250,11 @@ e.g. a `concat(flower, price)` index for `flower == "rose" AND price < 50`) and 
 `OR` of index-able branches with a **de-duplicated union** of index scans, falling back to a
 full scan otherwise.
 
+A filter on the **primary key** (or its leading prefix) is served by a direct record-range
+scan — no secondary index needed, and no extra fetch (the records are the scan). So a primary
+key is both a uniqueness constraint *and* a queryable index; don't add a secondary index that
+just duplicates it.
+
 For queries that only need indexed columns, **covering reads** skip the record fetch entirely:
 
 ```swift

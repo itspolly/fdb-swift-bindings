@@ -59,6 +59,11 @@ extension FDBRecordStore {
         switch plan.source {
         case .fullScan:
             base = Self.filtered(try scan(M.self), by: filter)
+        case .primaryKeyScan(let equalityBounds, let trailing):
+            let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
+            let (begin, end) = Self.scanRange(
+                prefix: typeSubspace.prefix, equalityBounds: equalityBounds, trailing: trailing)
+            base = recordRangeCursor(begin: begin, end: end, recordType: recordType, filter: filter)
         case .indexScan(let scan):
             let primaryKeys = try await collectPrimaryKeys([scan], recordType: recordType, distinct: needsDistinct)
             base = recordCursor(primaryKeys: primaryKeys, recordType: recordType, filter: filter)
@@ -175,6 +180,14 @@ extension FDBRecordStore {
             let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
             return try await keyBasedPage(
                 range: typeSubspace.range, prefixLength: typeSubspace.prefix.count,
+                isIndexScan: false, recordType: recordType, filter: query.filter,
+                limit: limit, continuation: continuation)
+        case .primaryKeyScan(let equalityBounds, let trailing):
+            let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
+            let range = Self.scanRange(
+                prefix: typeSubspace.prefix, equalityBounds: equalityBounds, trailing: trailing)
+            return try await keyBasedPage(
+                range: range, prefixLength: typeSubspace.prefix.count,
                 isIndexScan: false, recordType: recordType, filter: query.filter,
                 limit: limit, continuation: continuation)
         case .indexScan(let scan):
@@ -303,6 +316,28 @@ extension FDBRecordStore {
         }
     }
 
+    /// A cursor over the clustered records in `[begin, end)` (a primary-key range), applying the
+    /// residual filter. The record bytes are read directly — no secondary-index indirection.
+    private func recordRangeCursor<M: SwiftProtobuf.Message & Sendable>(
+        begin: FDB.Bytes, end: FDB.Bytes, recordType: ErasedRecordType, filter: QueryComponent<M>?
+    ) -> RecordCursor<M> {
+        let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
+        let tx = transaction
+        let name = recordType.recordName
+        return RecordCursor {
+            var iterator = tx.getRange(beginKey: begin, endKey: end).makeAsyncIterator()
+            return {
+                while let (key, value) = try await iterator.next() {
+                    let primaryKey = Tuple(try typeSubspace.unpack(key))
+                    let message = try M(serializedBytes: value)
+                    if let filter, !filter.eval(message) { continue }
+                    return FDBStoredRecord(recordType: name, primaryKey: primaryKey, record: message)
+                }
+                return nil
+            }
+        }
+    }
+
     private static func filtered<M: SwiftProtobuf.Message & Sendable>(
         _ base: RecordCursor<M>, by filter: QueryComponent<M>?
     ) -> RecordCursor<M> {
@@ -320,11 +355,18 @@ extension FDBRecordStore {
 
     // MARK: - Helpers
 
-    /// Builds the `[begin, end)` byte range over `indexSubspace` for an index scan: an equality
-    /// prefix optionally narrowed by a trailing range comparison.
+    /// Builds the `[begin, end)` byte range over `indexSubspace` for an index scan.
     static func indexRange(_ indexSubspace: Subspace, _ scan: IndexScan) -> (FDB.Bytes, FDB.Bytes) {
-        let base = indexSubspace.prefix + Tuple(scan.equalityBounds).encode()
-        guard let trailing = scan.trailing else {
+        scanRange(prefix: indexSubspace.prefix, equalityBounds: scan.equalityBounds, trailing: scan.trailing)
+    }
+
+    /// Builds the `[begin, end)` byte range for an equality prefix optionally narrowed by a
+    /// trailing range comparison, under `prefix` (an index subspace or a record type subspace).
+    static func scanRange(
+        prefix: FDB.Bytes, equalityBounds: [any TupleElement], trailing: TrailingComparison?
+    ) -> (FDB.Bytes, FDB.Bytes) {
+        let base = prefix + Tuple(equalityBounds).encode()
+        guard let trailing else {
             return (base, base + [0xFF])
         }
         let low = base + Tuple(trailing.bound).encode()

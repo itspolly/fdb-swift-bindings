@@ -43,6 +43,9 @@ struct QueryPlan {
     enum Source {
         /// Scan every record of the type and filter in memory.
         case fullScan
+        /// Scan the clustered records directly over a primary-key prefix range (no secondary
+        /// index, no extra fetch — the records are the scan).
+        case primaryKeyScan(equalityBounds: [any TupleElement], trailing: TrailingComparison?)
         /// Scan a value index over a derived range, then load matching records.
         case indexScan(IndexScan)
         /// Union the results of several index scans (one per `OR` branch).
@@ -63,6 +66,12 @@ struct QueryPlan {
     var unionIndexNames: [String]? {
         if case .union(let scans) = source { return scans.map { $0.index.name } }
         return nil
+    }
+
+    /// Whether the plan scans by primary key.
+    var usesPrimaryKey: Bool {
+        if case .primaryKeyScan = source { return true }
+        return false
     }
 }
 
@@ -93,10 +102,21 @@ enum QueryPlanner {
             return QueryPlan(source: .union(scans), requiresDistinct: true)
         }
 
-        if let scan = matchIndexScan(
-            recordType: recordType, atoms: node.conjunctionAtoms, readableIndexNames: readableIndexNames
-        ) {
-            return QueryPlan(source: .indexScan(scan), requiresDistinct: scan.index.producesMultipleKeys)
+        let atoms = node.conjunctionAtoms
+        let indexScan = matchIndexScan(
+            recordType: recordType, atoms: atoms, readableIndexNames: readableIndexNames)
+        let primaryKeyMatch = matchColumns(recordType.primaryKeyIdentities, atoms)
+
+        // Prefer a primary-key scan when it constrains at least as much as the best index: it
+        // reads the clustered records directly (no per-record fetch) and is always unique.
+        if let pk = primaryKeyMatch,
+           indexScan == nil || pk.prefixLength >= indexScan!.prefixLength {
+            return QueryPlan(
+                source: .primaryKeyScan(equalityBounds: pk.equalityBounds, trailing: pk.trailing),
+                requiresDistinct: false)
+        }
+        if let indexScan {
+            return QueryPlan(source: .indexScan(indexScan), requiresDistinct: indexScan.index.producesMultipleKeys)
         }
         return QueryPlan(source: .fullScan, requiresDistinct: false)
     }
@@ -114,13 +134,21 @@ enum QueryPlanner {
         return best
     }
 
-    /// Matches an index's leading columns against the atoms: equality columns form the prefix,
-    /// then at most one range column, stopping at the first unmatched column.
-    static func scan(index: ErasedIndex, atoms: [IndexableAtom]) -> IndexScan? {
+    /// An equality prefix over a column list plus an optional trailing range — shared by index
+    /// and primary-key matching.
+    struct ColumnMatch {
+        let equalityBounds: [any TupleElement]
+        let trailing: TrailingComparison?
+        var prefixLength: Int { equalityBounds.count + (trailing == nil ? 0 : 1) }
+    }
+
+    /// Matches `columnIdentities` against the atoms: equality columns form the prefix, then at
+    /// most one range column, stopping at the first unmatched column. `nil` if nothing matches.
+    static func matchColumns(_ columnIdentities: [FieldID?], _ atoms: [IndexableAtom]) -> ColumnMatch? {
         var equalityBounds: [any TupleElement] = []
         var trailing: TrailingComparison?
 
-        for identityOptional in index.columnIdentities {
+        for identityOptional in columnIdentities {
             guard let identity = identityOptional else { break }
             if let equality = atoms.first(where: { $0.kind == .equals && identity.matches($0.fieldID) }) {
                 equalityBounds.append(equality.bound)
@@ -135,7 +163,13 @@ enum QueryPlanner {
         }
 
         guard !equalityBounds.isEmpty || trailing != nil else { return nil }
-        return IndexScan(index: index, equalityBounds: equalityBounds, trailing: trailing)
+        return ColumnMatch(equalityBounds: equalityBounds, trailing: trailing)
+    }
+
+    /// Matches an index's leading columns against the atoms.
+    static func scan(index: ErasedIndex, atoms: [IndexableAtom]) -> IndexScan? {
+        guard let match = matchColumns(index.columnIdentities, atoms) else { return nil }
+        return IndexScan(index: index, equalityBounds: match.equalityBounds, trailing: match.trailing)
     }
 
     /// Prefer more equality columns, then a longer overall prefix.
