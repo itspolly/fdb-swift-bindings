@@ -22,12 +22,15 @@
 import FoundationDB
 import SwiftProtobuf
 
-/// The version assigned to a stored record by a version index.
+/// A record's version: the commit versionstamp assigned by FoundationDB when the record was
+/// last written.
 ///
-/// Combines the transaction's 10-byte commit versionstamp with a 2-byte local counter that
-/// disambiguates records written in the same transaction.
-    public struct FDBRecordVersion: Sendable, Hashable {
-    /// The complete 12-byte version (10-byte global versionstamp + 2-byte local order).
+/// Monotonic and unique per committing transaction, so it changes every time the record is
+/// saved — an opaque optimistic-concurrency token (an ETag). Populated on `load` for record
+/// types that opt in via ``RecordType/storingVersions(_:)``, and compared by
+/// ``FDBRecordStore/save(_:ifVersionMatches:)``.
+public struct FDBRecordVersion: Sendable, Hashable {
+    /// The raw version bytes (a FoundationDB versionstamp).
     public let bytes: FDB.Bytes
 
     public init(bytes: FDB.Bytes) {

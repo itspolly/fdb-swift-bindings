@@ -307,6 +307,27 @@ RecordType(User.self, key: 1, primaryKey: \.id)
     .index("email", on: \.email, key: 10, unique: true)
 ```
 
+### Record versions & optimistic concurrency
+
+Opt a record type into versioning with `.storingVersions()`. Each save stamps the record with
+the transaction's commit versionstamp (an opaque, monotonic ETag), surfaced as
+`FDBStoredRecord.version` on load. `save(_:ifVersionMatches:)` writes only if the stored version
+still matches — otherwise it throws `RecordStoreError.versionMismatch`, which is **not** a
+retryable error, so the surrounding retry loop does not silently re-run your update. Pass `nil`
+to require that the record does not yet exist (create-only).
+
+```swift
+RecordType(Order.self, key: 1, primaryKey: \.orderId).storingVersions()
+
+// Request A: read + return the version as an ETag.
+let stored = try await store.load(Order.self, id)
+// Request B (later): update only if unchanged since A.
+try await store.save(updated, ifVersionMatches: stored?.version)  // throws .versionMismatch if stale
+```
+
+Within a single transaction you don't need this — reading a record already makes a concurrent
+modification conflict; versions are for stateless, cross-request "if unchanged" updates.
+
 ### Indexing enum fields
 
 Protobuf scalar fields are indexable out of the box. A protobuf **enum** needs a one-line,

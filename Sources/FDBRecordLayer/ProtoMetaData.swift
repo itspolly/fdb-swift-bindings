@@ -181,6 +181,7 @@ private func makeErasedRecordType(
             recordName: M.protoMessageName,
             typeKey: -1,
             explicitKey: nil,
+            storesVersions: false,
             primaryKeyColumns: { message in
                 primaryKeyFields.map { extractFieldValues(message, fieldNumber: $0).first ?? NullValue() }
             },

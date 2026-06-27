@@ -54,6 +54,9 @@ public struct RecordType<M: SwiftProtobuf.Message>: ErasableRecordType, Sendable
     /// is independent of declaration order; when `nil`, a positional key is assigned. Treat keys
     /// like protobuf field numbers: never reuse a retired one.
     public let key: Int?
+    /// Whether each record carries a commit-versionstamp version (enables
+    /// ``FDBRecordStore/save(_:ifVersionMatches:)`` and populates ``FDBStoredRecord/version``).
+    public private(set) var storesVersions: Bool = false
 
     /// Creates a record type with an explicit primary-key expression.
     public init(_ type: M.Type, key: Int? = nil, primaryKey: KeyExpression<M>) {
@@ -69,6 +72,14 @@ public struct RecordType<M: SwiftProtobuf.Message>: ErasableRecordType, Sendable
     }
 
     // Composite primary keys use `init(_:primaryKey:)` with `.concat(...)`.
+
+    /// Enables per-record versioning for this type (a commit versionstamp stored alongside each
+    /// record), unlocking optimistic-concurrency saves.
+    public func storingVersions(_ enabled: Bool = true) -> RecordType<M> {
+        var copy = self
+        copy.storesVersions = enabled
+        return copy
+    }
 
     // MARK: Index builders (chainable)
 
@@ -116,6 +127,7 @@ public struct RecordType<M: SwiftProtobuf.Message>: ErasableRecordType, Sendable
             recordName: recordName,
             typeKey: -1,
             explicitKey: key,
+            storesVersions: storesVersions,
             primaryKeyColumns: { message in pk.evaluate(message as! M).first ?? [] },
             primaryKeyIdentities: pk.columnIdentities,
             deserialize: { bytes in try M(serializedBytes: bytes) },
@@ -149,6 +161,8 @@ struct ErasedRecordType: Sendable {
     var typeKey: Int
     /// Caller-supplied stable key, if any (otherwise positional).
     let explicitKey: Int?
+    /// Whether each record carries a commit-versionstamp version.
+    let storesVersions: Bool
     let primaryKeyColumns: @Sendable (any SwiftProtobuf.Message) -> [any TupleElement]
     let primaryKeyIdentities: [FieldID?]
     let deserialize: @Sendable ([UInt8]) throws -> any SwiftProtobuf.Message

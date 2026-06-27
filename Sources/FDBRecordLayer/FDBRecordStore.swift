@@ -39,6 +39,11 @@ public enum RecordStoreError: Error, Sendable {
     case queryNotCovered(String)
     /// A save would violate a unique index (another record already has the same key).
     case uniquenessViolation(index: String)
+    /// A conditional save's expected version did not match the stored version. Not retryable —
+    /// the caller should re-read and decide.
+    case versionMismatch
+    /// `save(_:ifVersionMatches:)` was used on a type that does not opt into record versions.
+    case recordVersioningDisabled(String)
 }
 
 /// The primary entry point for storing, retrieving, and querying records.
@@ -62,6 +67,7 @@ public final class FDBRecordStore {
     let storeInfoSubspace: Subspace
     let recordsSubspace: Subspace
     let indexesSubspace: Subspace
+    let versionsSubspace: Subspace
 
     var transaction: any TransactionProtocol { context.transaction }
 
@@ -90,6 +96,7 @@ public final class FDBRecordStore {
         self.storeInfoSubspace = subspace.child(Int64(0))
         self.recordsSubspace = subspace.child(Int64(1))
         self.indexesSubspace = subspace.child(Int64(2))
+        self.versionsSubspace = subspace.child(Int64(3))
     }
 
     // MARK: - Opening
@@ -186,7 +193,36 @@ public final class FDBRecordStore {
             )
         }
 
+        if recordType.storesVersions {
+            stampVersion(recordType: recordType, primaryKeyEncoded: primaryKeyEncoded)
+        }
+
         return FDBStoredRecord(recordType: recordType.recordName, primaryKey: Tuple(primaryKeyColumns), record: record)
+    }
+
+    /// Saves `record` only if the stored version equals `expected` (an optimistic-concurrency
+    /// "if unchanged" save). Pass `nil` to require that no record currently exists.
+    ///
+    /// Throws ``RecordStoreError/versionMismatch`` — which is **not** retryable, so the
+    /// surrounding `withTransaction`/`withRecordContext` does not silently retry — when the
+    /// versions differ. The record type must opt in with ``RecordType/storingVersions(_:)``.
+    @discardableResult
+    public func save<M: SwiftProtobuf.Message & Sendable>(
+        _ record: M, ifVersionMatches expected: FDBRecordVersion?
+    ) async throws -> FDBStoredRecord<M> {
+        guard let recordType = metaData.recordType(for: M.self) else {
+            throw RecordStoreError.unknownRecordType(M.protoMessageName)
+        }
+        guard recordType.storesVersions else {
+            throw RecordStoreError.recordVersioningDisabled(M.protoMessageName)
+        }
+        let primaryKeyEncoded = Tuple(recordType.primaryKeyColumns(record)).encode()
+        // Non-snapshot read so a concurrent change to this record's version conflicts.
+        let current = try await readVersion(recordType: recordType, primaryKeyEncoded: primaryKeyEncoded)
+        guard current == expected else {
+            throw RecordStoreError.versionMismatch
+        }
+        return try await save(record)
     }
 
     /// Loads the record of type `M` with the given primary key, or `nil` if none exists.
@@ -199,7 +235,11 @@ public final class FDBRecordStore {
         let recordKey = recordsSubspace.child(Int64(recordType.typeKey)).prefix + primaryKey.encode()
         guard let bytes = try await transaction.getValue(for: recordKey) else { return nil }
         let message = try M(serializedBytes: bytes)
-        return FDBStoredRecord(recordType: recordType.recordName, primaryKey: primaryKey, record: message)
+        let version = recordType.storesVersions
+            ? try await readVersion(recordType: recordType, primaryKeyEncoded: primaryKey.encode())
+            : nil
+        return FDBStoredRecord(
+            recordType: recordType.recordName, primaryKey: primaryKey, record: message, version: version)
     }
 
     /// Convenience: load by primary-key elements, e.g. `load(Order.self, 42)`.
@@ -234,6 +274,9 @@ public final class FDBRecordStore {
                 primaryKeyEncoded: primaryKeyEncoded
             )
         }
+        if recordType.storesVersions {
+            transaction.clear(key: versionKey(recordType: recordType, primaryKeyEncoded: primaryKeyEncoded))
+        }
         return true
     }
 
@@ -243,6 +286,8 @@ public final class FDBRecordStore {
         transaction.clearRange(beginKey: records.begin, endKey: records.end)
         let indexes = indexesSubspace.range
         transaction.clearRange(beginKey: indexes.begin, endKey: indexes.end)
+        let versions = versionsSubspace.range
+        transaction.clearRange(beginKey: versions.begin, endKey: versions.end)
     }
 
     // MARK: - Scanning
@@ -372,6 +417,35 @@ public final class FDBRecordStore {
             throw RecordStoreError.unknownIndex(name)
         }
         return index
+    }
+
+    // MARK: - Record versions
+
+    private func versionKey(recordType: ErasedRecordType, primaryKeyEncoded: FDB.Bytes) -> FDB.Bytes {
+        versionsSubspace.child(Int64(recordType.typeKey)).prefix + primaryKeyEncoded
+    }
+
+    /// Reads a record's stored version, or `nil` if it has none.
+    private func readVersion(
+        recordType: ErasedRecordType, primaryKeyEncoded: FDB.Bytes
+    ) async throws -> FDBRecordVersion? {
+        guard let bytes = try await transaction.getValue(
+            for: versionKey(recordType: recordType, primaryKeyEncoded: primaryKeyEncoded)) else {
+            return nil
+        }
+        return FDBRecordVersion(bytes: bytes)
+    }
+
+    /// Stamps the record's version with this transaction's commit versionstamp (resolved at
+    /// commit). A 10-byte placeholder plus a little-endian offset of 0 tells FoundationDB to
+    /// write the versionstamp as the whole value.
+    private func stampVersion(recordType: ErasedRecordType, primaryKeyEncoded: FDB.Bytes) {
+        let placeholder = FDB.Bytes(repeating: 0, count: 10)
+        let param = placeholder + withUnsafeBytes(of: UInt32(0).littleEndian) { Array($0) }
+        transaction.atomicOp(
+            key: versionKey(recordType: recordType, primaryKeyEncoded: primaryKeyEncoded),
+            param: param,
+            mutationType: .setVersionstampedValue)
     }
 
     static func encodeInt(_ value: Int) -> FDB.Bytes {
