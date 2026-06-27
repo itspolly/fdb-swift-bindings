@@ -44,6 +44,10 @@ public enum RecordStoreError: Error, Sendable {
     case versionMismatch
     /// `save(_:ifVersionMatches:)` was used on a type that does not opt into record versions.
     case recordVersioningDisabled(String)
+    /// `insert(_:)` found an existing record with the same primary key.
+    case recordAlreadyExists(String)
+    /// `update(_:)` found no existing record with the given primary key.
+    case recordDoesNotExist(String)
 }
 
 /// The primary entry point for storing, retrieving, and querying records.
@@ -221,6 +225,36 @@ public final class FDBRecordStore {
         let current = try await readVersion(recordType: recordType, primaryKeyEncoded: primaryKeyEncoded)
         guard current == expected else {
             throw RecordStoreError.versionMismatch
+        }
+        return try await save(record)
+    }
+
+    /// Saves `record` only if no record with its primary key exists, else throws
+    /// ``RecordStoreError/recordAlreadyExists(_:)`` (not retryable).
+    @discardableResult
+    public func insert<M: SwiftProtobuf.Message & Sendable>(_ record: M) async throws -> FDBStoredRecord<M> {
+        guard let recordType = metaData.recordType(for: M.self) else {
+            throw RecordStoreError.unknownRecordType(M.protoMessageName)
+        }
+        let recordKey = recordsSubspace.child(Int64(recordType.typeKey)).prefix
+            + Tuple(recordType.primaryKeyColumns(record)).encode()
+        if try await transaction.getValue(for: recordKey) != nil {
+            throw RecordStoreError.recordAlreadyExists(M.protoMessageName)
+        }
+        return try await save(record)
+    }
+
+    /// Saves `record` only if a record with its primary key already exists, else throws
+    /// ``RecordStoreError/recordDoesNotExist(_:)`` (not retryable).
+    @discardableResult
+    public func update<M: SwiftProtobuf.Message & Sendable>(_ record: M) async throws -> FDBStoredRecord<M> {
+        guard let recordType = metaData.recordType(for: M.self) else {
+            throw RecordStoreError.unknownRecordType(M.protoMessageName)
+        }
+        let recordKey = recordsSubspace.child(Int64(recordType.typeKey)).prefix
+            + Tuple(recordType.primaryKeyColumns(record)).encode()
+        if try await transaction.getValue(for: recordKey) == nil {
+            throw RecordStoreError.recordDoesNotExist(M.protoMessageName)
         }
         return try await save(record)
     }

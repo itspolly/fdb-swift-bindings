@@ -221,6 +221,10 @@ try await database.withRecordContext { context in
 }
 ```
 
+`save` is an upsert (insert-or-replace by primary key). For existence assertions use
+`insert(_:)` (throws `recordAlreadyExists` if the primary key is taken) and `update(_:)`
+(throws `recordDoesNotExist` if it isn't).
+
 ### Query
 
 Build a `RecordQuery` with the fluent `Query` API; the planner chooses an index scan or full
