@@ -24,6 +24,7 @@ message Order {
   Customer customer = 4;
   repeated string tags = 5;
   Color color = 6;
+  bool fulfilled = 7;
 }
 
 // A second record type sharing the store, used for multi-type and aggregate tests.

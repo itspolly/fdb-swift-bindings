@@ -110,7 +110,7 @@ public enum Query {
     /// The field identity carries both the key path and (when it is a top-level scalar) the
     /// resolved protobuf field number, so the predicate can match indexes declared either via
     /// the Swift DSL or via proto annotations.
-    public static func field<M: SwiftProtobuf.Message, V: IndexableValue & Comparable>(
+    public static func field<M: SwiftProtobuf.Message, V: IndexableValue>(
         _ keyPath: WritableKeyPath<M, V> & Sendable
     ) -> FieldComparison<M, V> {
         FieldComparison(
@@ -120,7 +120,7 @@ public enum Query {
     }
 
     /// Begins a comparison against an optional field (supports null predicates).
-    public static func field<M: SwiftProtobuf.Message, V: IndexableValue & Comparable>(
+    public static func field<M: SwiftProtobuf.Message, V: IndexableValue>(
         _ keyPath: WritableKeyPath<M, V?> & Sendable
     ) -> OptionalFieldComparison<M, V> {
         OptionalFieldComparison(
@@ -130,7 +130,7 @@ public enum Query {
     }
 
     /// Begins a membership comparison against a repeated field ("one of them").
-    public static func any<M: SwiftProtobuf.Message, V: IndexableValue & Comparable>(
+    public static func any<M: SwiftProtobuf.Message, V: IndexableValue>(
         _ keyPath: WritableKeyPath<M, [V]> & Sendable
     ) -> RepeatedFieldComparison<M, V> {
         RepeatedFieldComparison(
@@ -173,29 +173,34 @@ public enum Query {
 }
 
 /// Fluent comparisons for a scalar field, produced by ``Query/field(_:)-(KeyPath<M,V>&Sendable)``.
-public struct FieldComparison<M, V: IndexableValue & Comparable> {
+///
+/// `equals`/`notEquals` are available for any `Equatable` field; the ordering comparisons require
+/// the field be `Comparable` (so e.g. `Bool` and enums support equality but not `lessThan`).
+public struct FieldComparison<M, V: IndexableValue> {
     let keyPath: KeyPath<M, V> & Sendable
     let fieldID: FieldID
 
+    fileprivate func make(
+        _ kind: ComparisonKind, _ value: V, _ test: @escaping @Sendable (V) -> Bool
+    ) -> QueryComponent<M> {
+        let keyPath = self.keyPath
+        let node: PredicateNode = kind.isIndexable
+            ? .comparison(IndexableAtom(fieldID: fieldID, kind: kind, bound: value.asTupleElement()))
+            : .unindexable
+        return QueryComponent(eval: { test($0[keyPath: keyPath]) }, node: node)
+    }
+}
+
+extension FieldComparison where V: Equatable {
     public func equals(_ value: V) -> QueryComponent<M> { make(.equals, value) { $0 == value } }
     public func notEquals(_ value: V) -> QueryComponent<M> { make(.notEquals, value) { $0 != value } }
+}
+
+extension FieldComparison where V: Comparable {
     public func lessThan(_ value: V) -> QueryComponent<M> { make(.lessThan, value) { $0 < value } }
     public func lessThanOrEquals(_ value: V) -> QueryComponent<M> { make(.lessThanOrEquals, value) { $0 <= value } }
     public func greaterThan(_ value: V) -> QueryComponent<M> { make(.greaterThan, value) { $0 > value } }
     public func greaterThanOrEquals(_ value: V) -> QueryComponent<M> { make(.greaterThanOrEquals, value) { $0 >= value } }
-
-    private func make(
-        _ kind: ComparisonKind, _ value: V, _ test: @escaping @Sendable (V) -> Bool
-    ) -> QueryComponent<M> {
-        let keyPath = self.keyPath
-        return QueryComponent(eval: { test($0[keyPath: keyPath]) }, node: Self.node(kind, fieldID, value))
-    }
-
-    static func node(_ kind: ComparisonKind, _ fieldID: FieldID, _ value: V) -> PredicateNode {
-        kind.isIndexable
-            ? .comparison(IndexableAtom(fieldID: fieldID, kind: kind, bound: value.asTupleElement()))
-            : .unindexable
-    }
 }
 
 extension FieldComparison where V == String {
@@ -207,13 +212,9 @@ extension FieldComparison where V == String {
 }
 
 /// Fluent comparisons for an optional field.
-public struct OptionalFieldComparison<M, V: IndexableValue & Comparable> {
+public struct OptionalFieldComparison<M, V: IndexableValue> {
     let keyPath: KeyPath<M, V?> & Sendable
     let fieldID: FieldID
-
-    public func equals(_ value: V) -> QueryComponent<M> { make(.equals, value) { $0 == value } }
-    public func lessThan(_ value: V) -> QueryComponent<M> { make(.lessThan, value) { $0 < value } }
-    public func greaterThan(_ value: V) -> QueryComponent<M> { make(.greaterThan, value) { $0 > value } }
 
     /// Matches records where the field is absent.
     public func isNull() -> QueryComponent<M> {
@@ -227,7 +228,7 @@ public struct OptionalFieldComparison<M, V: IndexableValue & Comparable> {
         return QueryComponent(eval: { $0[keyPath: keyPath] != nil }, node: .unindexable)
     }
 
-    private func make(
+    fileprivate func make(
         _ kind: ComparisonKind, _ value: V, _ test: @escaping @Sendable (V) -> Bool
     ) -> QueryComponent<M> {
         let keyPath = self.keyPath
@@ -241,11 +242,22 @@ public struct OptionalFieldComparison<M, V: IndexableValue & Comparable> {
     }
 }
 
+extension OptionalFieldComparison where V: Equatable {
+    public func equals(_ value: V) -> QueryComponent<M> { make(.equals, value) { $0 == value } }
+}
+
+extension OptionalFieldComparison where V: Comparable {
+    public func lessThan(_ value: V) -> QueryComponent<M> { make(.lessThan, value) { $0 < value } }
+    public func greaterThan(_ value: V) -> QueryComponent<M> { make(.greaterThan, value) { $0 > value } }
+}
+
 /// Fluent membership comparisons for a repeated field.
-public struct RepeatedFieldComparison<M, V: IndexableValue & Comparable> {
+public struct RepeatedFieldComparison<M, V: IndexableValue> {
     let keyPath: KeyPath<M, [V]> & Sendable
     let fieldID: FieldID
+}
 
+extension RepeatedFieldComparison where V: Equatable {
     /// Matches records where some element of the field equals `value`.
     public func equals(_ value: V) -> QueryComponent<M> {
         let keyPath = self.keyPath

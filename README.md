@@ -259,6 +259,9 @@ scan — no secondary index needed, and no extra fetch (the records are the scan
 key is both a uniqueness constraint *and* a queryable index; don't add a secondary index that
 just duplicates it.
 
+`equals`/`notEquals` work on any `Equatable` field (including `Bool` and protobuf enums); the
+ordering comparisons (`lessThan`, `greaterThan`, …) require the field to be `Comparable`.
+
 For queries that only need indexed columns, **covering reads** skip the record fetch entirely:
 
 ```swift
