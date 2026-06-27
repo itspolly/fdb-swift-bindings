@@ -325,6 +325,8 @@ let stored = try await store.load(Order.self, id)
 try await store.save(updated, ifVersionMatches: stored?.version)  // throws .versionMismatch if stale
 ```
 
+`delete(_:primaryKey:ifVersionMatches:)` deletes under the same condition.
+
 Within a single transaction you don't need this — reading a record already makes a concurrent
 modification conflict; versions are for stateless, cross-request "if unchanged" updates.
 

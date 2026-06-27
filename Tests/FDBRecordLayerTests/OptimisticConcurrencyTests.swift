@@ -89,5 +89,40 @@ struct OptimisticConcurrencyTests {
             #expect(blocked)
         }
     }
+
+    /// Runs a conditional delete and reports whether it failed with `.versionMismatch`.
+    private func deleteMismatches(_ run: StoreRunner, _ primaryKey: Tuple, ifVersionMatches expected: FDBRecordVersion?) async throws -> Bool {
+        do {
+            _ = try await run { try await $0.delete(Fdb_Test_Order.self, primaryKey: primaryKey, ifVersionMatches: expected) }
+            return false
+        } catch let error as RecordStoreError {
+            if case .versionMismatch = error { return true }
+            throw error
+        }
+    }
+
+    @Test("conditional delete removes only on a matching version")
+    func conditionalDelete() async throws {
+        try await RecordLayerTestCase.withStore(metaData: meta()) { run in
+            try await run { _ = try await $0.save(Fdb_Test_Order.sample(id: 1, price: 10)) }
+            let v1 = try await run { try await $0.load(Fdb_Test_Order.self, Int64(1))?.version }
+
+            // Make v1 stale.
+            try await run { _ = try await $0.save(Fdb_Test_Order.sample(id: 1, price: 20), ifVersionMatches: v1) }
+
+            // Delete with the stale version → mismatch, record survives.
+            let stale = try await deleteMismatches(run, Tuple(Int64(1)), ifVersionMatches: v1)
+            #expect(stale)
+            #expect(try await run { try await $0.load(Fdb_Test_Order.self, Int64(1)) } != nil)
+
+            // Delete with the current version → succeeds.
+            let v2 = try await run { try await $0.load(Fdb_Test_Order.self, Int64(1))?.version }
+            let deleted = try await run {
+                try await $0.delete(Fdb_Test_Order.self, primaryKey: Tuple(Int64(1)), ifVersionMatches: v2)
+            }
+            #expect(deleted)
+            #expect(try await run { try await $0.load(Fdb_Test_Order.self, Int64(1)) } == nil)
+        }
+    }
 }
 #endif

@@ -280,6 +280,29 @@ public final class FDBRecordStore {
         return true
     }
 
+    /// Deletes the record only if its stored version equals `expected` (optimistic concurrency).
+    ///
+    /// Throws ``RecordStoreError/versionMismatch`` (not retryable) when the versions differ. Pass
+    /// `nil` to require that no record currently exists (in which case this is a no-op returning
+    /// `false`). The record type must opt in with ``RecordType/storingVersions(_:)``.
+    @discardableResult
+    public func delete<M: SwiftProtobuf.Message & Sendable>(
+        _ type: M.Type, primaryKey: Tuple, ifVersionMatches expected: FDBRecordVersion?
+    ) async throws -> Bool {
+        guard let recordType = metaData.recordType(for: M.self) else {
+            throw RecordStoreError.unknownRecordType(M.protoMessageName)
+        }
+        guard recordType.storesVersions else {
+            throw RecordStoreError.recordVersioningDisabled(M.protoMessageName)
+        }
+        // Non-snapshot read so a concurrent change to this record's version conflicts.
+        let current = try await readVersion(recordType: recordType, primaryKeyEncoded: primaryKey.encode())
+        guard current == expected else {
+            throw RecordStoreError.versionMismatch
+        }
+        return try await delete(type, primaryKey: primaryKey)
+    }
+
     /// Removes every record and index entry in the store (but keeps the header).
     public func deleteAllRecords() async throws {
         let records = recordsSubspace.range
