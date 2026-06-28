@@ -71,6 +71,8 @@ extension FDB {
         let endSelector: FDB.KeySelector
         /// Whether to use snapshot reads
         let snapshot: Bool
+        /// Whether to iterate in reverse (descending key) order
+        let reverse: Bool
         /// Maximum number of key-value pairs to fetch per batch (0 = use FDB default)
         let batchLimit: Int = 0
 
@@ -86,6 +88,7 @@ extension FDB {
                 beginSelector: beginSelector,
                 endSelector: endSelector,
                 snapshot: snapshot,
+                reverse: reverse,
                 batchLimit: batchLimit
             )
         }
@@ -111,12 +114,14 @@ extension FDB {
         public struct AsyncIterator: AsyncIteratorProtocol {
             /// Transaction used for all range queries
             private let transaction: TransactionProtocol
-            /// Key selector for the next batch to fetch
+            /// Begin key selector for the next batch (advances forward; constant when reverse)
             private var nextBeginSelector: FDB.KeySelector
-            /// End key selector (remains constant)
-            private let endSelector: FDB.KeySelector
+            /// End key selector for the next batch (advances backward when reverse; else constant)
+            private var nextEndSelector: FDB.KeySelector
             /// Whether to use snapshot reads
             private let snapshot: Bool
+            /// Whether to iterate in reverse (descending key) order
+            private let reverse: Bool
             /// Batch size limit
             private let batchLimit: Int
 
@@ -147,13 +152,14 @@ extension FDB {
             ///   - batchLimit: Maximum items per batch (0 = FDB default)
             init(
                 transaction: TransactionProtocol, beginSelector: FDB.KeySelector,
-                endSelector: FDB.KeySelector, snapshot: Bool, batchLimit: Int
+                endSelector: FDB.KeySelector, snapshot: Bool, reverse: Bool, batchLimit: Int
             ) {
                 self.transaction = transaction
                 nextBeginSelector = beginSelector
-                self.endSelector = endSelector
+                nextEndSelector = endSelector
                 self.batchLimit = batchLimit
                 self.snapshot = snapshot
+                self.reverse = reverse
 
                 // Start fetching immediately to minimize latency on first next() call
                 startBackgroundPreFetch()
@@ -208,8 +214,14 @@ extension FDB {
                 currentIndex = 0
 
                 if !currentBatch.records.isEmpty, currentBatch.more {
+                    // `last` is the lowest key in a reverse batch and the highest otherwise, so
+                    // reverse continues by retreating the (exclusive) end; forward by advancing begin.
                     let lastKey = nextBatch.records.last!.0
-                    nextBeginSelector = FDB.KeySelector.firstGreaterThan(lastKey)
+                    if reverse {
+                        nextEndSelector = FDB.KeySelector.firstGreaterOrEqual(lastKey)
+                    } else {
+                        nextBeginSelector = FDB.KeySelector.firstGreaterThan(lastKey)
+                    }
                     startBackgroundPreFetch()
                 } else {
                     preFetchTask = nil
@@ -227,12 +239,13 @@ extension FDB {
             /// during batch transitions.
             private mutating func startBackgroundPreFetch() {
                 preFetchTask = Task {
-                    [transaction, nextBeginSelector, endSelector, batchLimit, snapshot] in
+                    [transaction, nextBeginSelector, nextEndSelector, batchLimit, snapshot, reverse] in
                     return try await transaction.getRangeNative(
                         beginSelector: nextBeginSelector,
-                        endSelector: endSelector,
+                        endSelector: nextEndSelector,
                         limit: batchLimit,
-                        snapshot: snapshot
+                        snapshot: snapshot,
+                        reverse: reverse
                     )
                 }
             }

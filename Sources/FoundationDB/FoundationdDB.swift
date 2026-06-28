@@ -105,9 +105,10 @@ public protocol TransactionProtocol: Sendable {
     ///   - beginSelector: The key selector for the start of the range.
     ///   - endSelector: The key selector for the end of the range.
     ///   - snapshot: Whether to perform a snapshot read.
+    ///   - reverse: Whether to yield key-value pairs in reverse (descending key) order.
     /// - Returns: An async sequence that yields key-value pairs.
     func getRange(
-        beginSelector: FDB.KeySelector, endSelector: FDB.KeySelector, snapshot: Bool
+        beginSelector: FDB.KeySelector, endSelector: FDB.KeySelector, snapshot: Bool, reverse: Bool
     ) -> FDB.AsyncKVSequence
 
     /// Retrieves key-value pairs within a range using key selectors.
@@ -120,10 +121,12 @@ public protocol TransactionProtocol: Sendable {
     ///   - endSelector: The key selector for the end of the range.
     ///   - limit: Maximum number of key-value pairs to return (0 for no limit).
     ///   - snapshot: Whether to perform a snapshot read.
+    ///   - reverse: Whether to return the range in reverse (descending key) order.
     /// - Returns: A `ResultRange` containing the key-value pairs and more flag.
     /// - Throws: `FDBError` if the operation fails.
     func getRangeNative(
-        beginSelector: FDB.KeySelector, endSelector: FDB.KeySelector, limit: Int, snapshot: Bool
+        beginSelector: FDB.KeySelector, endSelector: FDB.KeySelector, limit: Int, snapshot: Bool,
+        reverse: Bool
     ) async throws -> ResultRange
 
     /// Retrieves key-value pairs within a range using byte array keys.
@@ -345,51 +348,45 @@ extension TransactionProtocol {
     }
 
     public func getRange(
-        beginSelector: FDB.KeySelector, endSelector: FDB.KeySelector, snapshot: Bool = false
+        beginSelector: FDB.KeySelector, endSelector: FDB.KeySelector, snapshot: Bool = false,
+        reverse: Bool = false
     ) -> FDB.AsyncKVSequence {
         FDB.AsyncKVSequence(
             transaction: self,
             beginSelector: beginSelector,
             endSelector: endSelector,
-            snapshot: snapshot
+            snapshot: snapshot,
+            reverse: reverse
         )
     }
 
     public func getRange(
-        beginSelector: FDB.KeySelector, endSelector: FDB.KeySelector
-    ) -> FDB.AsyncKVSequence {
-        getRange(
-            beginSelector: beginSelector, endSelector: endSelector, snapshot: false
-        )
-    }
-
-    public func getRange(
-        begin: FDB.Selectable, end: FDB.Selectable, snapshot: Bool = false
+        begin: FDB.Selectable, end: FDB.Selectable, snapshot: Bool = false, reverse: Bool = false
     ) -> FDB.AsyncKVSequence {
         let beginSelector = begin.toKeySelector()
         let endSelector = end.toKeySelector()
         return getRange(
-            beginSelector: beginSelector, endSelector: endSelector, snapshot: snapshot
+            beginSelector: beginSelector, endSelector: endSelector, snapshot: snapshot, reverse: reverse
         )
     }
 
-
     public func getRange(
-        beginKey: FDB.Bytes, endKey: FDB.Bytes, snapshot: Bool = false
+        beginKey: FDB.Bytes, endKey: FDB.Bytes, snapshot: Bool = false, reverse: Bool = false
     ) -> FDB.AsyncKVSequence {
         let beginSelector = FDB.KeySelector.firstGreaterOrEqual(beginKey)
         let endSelector = FDB.KeySelector.firstGreaterOrEqual(endKey)
         return getRange(
-            beginSelector: beginSelector, endSelector: endSelector, snapshot: snapshot
+            beginSelector: beginSelector, endSelector: endSelector, snapshot: snapshot, reverse: reverse
         )
     }
 
-    func getRangeNative(
+    public func getRangeNative(
         beginSelector: FDB.KeySelector, endSelector: FDB.KeySelector, limit: Int = 0,
         snapshot: Bool = false
     ) async throws -> ResultRange {
         try await getRangeNative(
-            beginSelector: beginSelector, endSelector: endSelector, limit: limit, snapshot: snapshot
+            beginSelector: beginSelector, endSelector: endSelector, limit: limit, snapshot: snapshot,
+            reverse: false
         )
     }
 

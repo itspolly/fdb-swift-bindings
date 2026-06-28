@@ -50,6 +50,18 @@ for try await (key, value) in sequence {
 }
 ```
 
+### Reverse ranges
+
+Pass `reverse: true` to `getRange` to stream a range in descending key order (paginated the same
+way as forward) — handy for "latest first" reads such as the tail of an event log:
+
+```swift
+let (begin, end) = log.range
+for try await (key, value) in transaction.getRange(beginKey: begin, endKey: end, reverse: true) {
+    // newest entries first
+}
+```
+
 ### Atomic Operations
 
 ```swift
