@@ -61,6 +61,12 @@ class Future<T: FutureResult> {
         fdb_future_destroy(cFuture)
     }
 
+    /// Cancels the underlying C future. A pending ``getAsync()`` then completes by throwing
+    /// `FDBError` with the `operation_cancelled` code.
+    func cancel() {
+        fdb_future_cancel(cFuture)
+    }
+
     /// Asynchronously waits for the future to complete and returns the result.
     ///
     /// This method bridges FoundationDB's callback-based API with Swift's async/await,

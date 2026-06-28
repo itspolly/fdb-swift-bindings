@@ -61,6 +61,26 @@ try await database.withTransaction { transaction in
 }
 ```
 
+### Watches (pub/sub)
+
+A **watch** completes when a key's value changes, giving you push notifications without polling.
+`database.watch(key:)` returns an `AsyncThrowingStream` that yields the key's current value, then
+the new value after every change — ideal for a live feed like a score:
+
+```swift
+let key = [UInt8]("match/score".utf8)
+for try await score in database.watch(key: key) {
+    print("score is now", score.map { String(decoding: $0, as: UTF8.self) } ?? "unset")
+}
+// Stop by breaking out of the loop; the underlying watch is cancelled automatically.
+```
+
+Rapid successive writes may coalesce into a single notification (you always get the latest
+value), and FoundationDB caps concurrent watches (the `MAX_WATCHES` database option). The same
+`watch(key:)` is available on `FDBTenant`. For one-shot use, `transaction.watch(key:)` returns an
+`FDBWatch` whose `wait()` resolves on the next change (the watch arms when the transaction
+commits).
+
 ### Subspaces
 
 `Subspace` and `KeySpacePath` namespace keys by a common prefix and integrate directly with

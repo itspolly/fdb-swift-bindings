@@ -141,6 +141,19 @@ public final class FDBTransaction: TransactionProtocol, @unchecked Sendable {
         fdb_transaction_cancel(transaction)
     }
 
+    public func watch(key: FDB.Bytes) -> FDBWatch {
+        let future = key.withUnsafeBytes { keyBytes in
+            Future<ResultVoid>(
+                fdb_transaction_watch(
+                    transaction,
+                    keyBytes.bindMemory(to: UInt8.self).baseAddress,
+                    Int32(key.count)
+                )
+            )
+        }
+        return FDBWatch(future: future)
+    }
+
     public func getVersionstamp() async throws -> FDB.Bytes? {
         try await Future<ResultKey>(
             fdb_transaction_get_versionstamp(transaction)

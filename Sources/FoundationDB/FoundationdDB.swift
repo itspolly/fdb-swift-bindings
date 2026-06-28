@@ -153,6 +153,14 @@ public protocol TransactionProtocol: Sendable {
     /// After calling this method, the transaction cannot be used for further operations.
     func cancel()
 
+    /// Sets a watch on `key`: returns an ``FDBWatch`` whose ``FDBWatch/wait()`` completes once the
+    /// key's value changes from what it was at this transaction's read version.
+    ///
+    /// The watch becomes active only after the transaction commits, and (unlike most operations)
+    /// the returned watch outlives the transaction. For repeated change notifications prefer the
+    /// higher-level ``DatabaseProtocol/watch(key:)`` stream.
+    func watch(key: FDB.Bytes) -> FDBWatch
+
     /// Gets the versionstamp for this transaction.
     ///
     /// The versionstamp is only available after the transaction has been committed.
