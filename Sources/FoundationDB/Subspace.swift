@@ -66,6 +66,16 @@ public struct Subspace: Sendable, Hashable {
         prefix
     }
 
+    /// Returns the key for `tuple` within this subspace, with the 4-byte little-endian offset of
+    /// its incomplete ``Versionstamp`` appended — ready for a `setVersionstampedKey` atomic op.
+    ///
+    /// The offset accounts for the subspace prefix. The tuple must contain exactly one top-level
+    /// incomplete versionstamp.
+    public func packWithVersionstamp(_ tuple: Tuple) throws -> FDB.Bytes {
+        let (bytes, offset) = try tuple.encodeWithVersionstampOffset()
+        return prefix + bytes + Tuple.littleEndian32(UInt32(prefix.count + offset))
+    }
+
     // MARK: - Unpacking
 
     /// Recovers the tuple elements encoded after the prefix in `key`.

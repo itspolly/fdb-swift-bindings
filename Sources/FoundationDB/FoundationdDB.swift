@@ -393,6 +393,15 @@ extension TransactionProtocol {
         )
     }
 
+    /// Sets `value` at a key whose incomplete versionstamp the database fills at commit.
+    ///
+    /// `keyWithVersionstamp` must come from ``Tuple/packWithVersionstamp()`` or
+    /// ``Subspace/packWithVersionstamp(_:)`` (it carries the required 4-byte offset suffix). A
+    /// convenience over `atomicOp(key:param:mutationType: .setVersionstampedKey)`.
+    public func setVersionstampedKey(_ keyWithVersionstamp: FDB.Bytes, value: FDB.Bytes) {
+        atomicOp(key: keyWithVersionstamp, param: value, mutationType: .setVersionstampedKey)
+    }
+
     public func setOption(forOption option: FDB.TransactionOption) throws {
         try setOption(to: nil, forOption: option)
     }

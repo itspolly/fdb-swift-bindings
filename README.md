@@ -61,6 +61,26 @@ try await database.withTransaction { transaction in
 }
 ```
 
+### Versionstamped keys (event log)
+
+The tuple layer supports **versionstamps** — a 10-byte commit version the database assigns
+atomically at commit, plus a 2-byte user version. Pack an incomplete versionstamp and write it
+with a `setVersionstampedKey` op to get append-only, globally-ordered, unique keys without a
+counter — ideal for an event log:
+
+```swift
+let log = Subspace(Tuple("events"))
+try await database.withTransaction { transaction in
+    let key = try log.packWithVersionstamp(Tuple(Versionstamp.incomplete()))
+    transaction.setVersionstampedKey(key, value: payload)   // version filled in at commit
+}
+```
+
+`packWithVersionstamp` appends the required 4-byte little-endian offset of the placeholder (on
+`Tuple` or, prefix-aware, on `Subspace`). Reading the range back yields entries in commit order,
+and `unpack` decodes each key's now-complete `Versionstamp`. After commit,
+`transaction.getVersionstamp()` returns the 10 bytes that were assigned.
+
 ### Watches (pub/sub)
 
 A **watch** completes when a key's value changes, giving you push notifications without polling.

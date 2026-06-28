@@ -25,6 +25,10 @@ public enum TupleError: Error, Sendable {
     case invalidEncoding
     case invalidDecoding(String)
     case unsupportedType
+    /// `packWithVersionstamp` was called on a tuple with no incomplete ``Versionstamp``.
+    case noIncompleteVersionstamp
+    /// `packWithVersionstamp` requires exactly one incomplete ``Versionstamp``; more than one was found.
+    case multipleIncompleteVersionstamps
 }
 
 enum TupleTypeCode: UInt8, CaseIterable {
@@ -97,6 +101,39 @@ public struct Tuple: Sendable, Hashable, Equatable {
         return result
     }
 
+    /// Encodes the tuple and appends the 4-byte little-endian offset of its incomplete
+    /// ``Versionstamp``, producing the key argument for a `setVersionstampedKey` atomic op.
+    ///
+    /// The tuple must contain exactly one incomplete versionstamp, at the top level (nested
+    /// incomplete versionstamps are not supported). FoundationDB replaces the 10-byte placeholder
+    /// at that offset with the transaction's commit versionstamp and strips the offset suffix.
+    public func packWithVersionstamp() throws -> FDB.Bytes {
+        let (bytes, offset) = try encodeWithVersionstampOffset()
+        return bytes + Tuple.littleEndian32(UInt32(offset))
+    }
+
+    /// Encodes the tuple, returning the bytes and the offset (within them) of the 10-byte
+    /// versionstamp placeholder. Shared by ``packWithVersionstamp()`` and `Subspace`.
+    func encodeWithVersionstampOffset() throws -> (bytes: FDB.Bytes, offset: Int) {
+        var result = FDB.Bytes()
+        var versionstampOffset: Int?
+        for element in elements {
+            let encoded = element.encodeTuple()
+            if let stamp = element as? Versionstamp, stamp.isIncomplete {
+                guard versionstampOffset == nil else { throw TupleError.multipleIncompleteVersionstamps }
+                // The type-code byte leads; the 10-byte versionstamp starts right after it.
+                versionstampOffset = result.count + 1
+            }
+            result.append(contentsOf: encoded)
+        }
+        guard let offset = versionstampOffset else { throw TupleError.noIncompleteVersionstamp }
+        return (result, offset)
+    }
+
+    static func littleEndian32(_ value: UInt32) -> FDB.Bytes {
+        withUnsafeBytes(of: value.littleEndian) { Array($0) }
+    }
+
     public static func decode(from bytes: FDB.Bytes) throws -> [any TupleElement] {
         var elements: [any TupleElement] = []
         var offset = 0
@@ -125,6 +162,9 @@ public struct Tuple: Sendable, Hashable, Equatable {
                 elements.append(element)
             case TupleTypeCode.uuid.rawValue:
                 let element = try UUID.decodeTuple(from: bytes, at: &offset)
+                elements.append(element)
+            case TupleTypeCode.versionstamp.rawValue:
+                let element = try Versionstamp.decodeTuple(from: bytes, at: &offset)
                 elements.append(element)
             case TupleTypeCode.intZero.rawValue:
                 elements.append(0)
@@ -366,6 +406,67 @@ extension UUID: TupleElement {
         )
 
         return UUID(uuid: uuidTuple)
+    }
+}
+
+/// A FoundationDB versionstamp tuple element: a 10-byte commit version (assigned by the database)
+/// plus a 2-byte user version for ordering multiple stamps written in one transaction.
+///
+/// Create an ``incomplete(_:)`` versionstamp to have the database fill the 10-byte part at commit
+/// (via ``Tuple/packWithVersionstamp()`` + a `setVersionstampedKey` op) — ideal for append-only,
+/// globally-ordered keys such as an event log. After commit, ``FDBTransaction/getVersionstamp()``
+/// returns the assigned 10 bytes, which you can wrap in a complete `Versionstamp` to read the key.
+public struct Versionstamp: TupleElement {
+    /// The 10-byte transaction versionstamp (8-byte version + 2-byte batch order). All `0xFF`
+    /// while incomplete.
+    public let transactionVersion: FDB.Bytes
+    /// A caller-supplied 2-byte value ordering multiple versionstamps from the same transaction.
+    public let userVersion: UInt16
+    /// Whether the transaction version is a placeholder to be assigned by the database at commit.
+    public let isIncomplete: Bool
+
+    /// The size of the encoded versionstamp payload (10-byte version + 2-byte user version).
+    static let payloadSize = 12
+
+    /// A complete versionstamp from a known 10-byte transaction version.
+    public init(transactionVersion: FDB.Bytes, userVersion: UInt16 = 0) {
+        precondition(transactionVersion.count == 10, "transaction version must be 10 bytes")
+        self.transactionVersion = transactionVersion
+        self.userVersion = userVersion
+        self.isIncomplete = false
+    }
+
+    private init(incompleteWithUserVersion userVersion: UInt16) {
+        self.transactionVersion = FDB.Bytes(repeating: 0xFF, count: 10)
+        self.userVersion = userVersion
+        self.isIncomplete = true
+    }
+
+    /// An incomplete versionstamp whose 10-byte version the database assigns at commit time.
+    public static func incomplete(_ userVersion: UInt16 = 0) -> Versionstamp {
+        Versionstamp(incompleteWithUserVersion: userVersion)
+    }
+
+    public func encodeTuple() -> FDB.Bytes {
+        var encoded = [TupleTypeCode.versionstamp.rawValue]
+        encoded.append(contentsOf: transactionVersion)
+        encoded.append(contentsOf: withUnsafeBytes(of: userVersion.bigEndian) { Array($0) })
+        return encoded
+    }
+
+    public static func decodeTuple(from bytes: FDB.Bytes, at offset: inout Int) throws -> Versionstamp {
+        guard offset + payloadSize <= bytes.count else {
+            throw TupleError.invalidDecoding("Not enough bytes for Versionstamp")
+        }
+        let version = Array(bytes[offset ..< offset + 10])
+        let userHigh = UInt16(bytes[offset + 10])
+        let userLow = UInt16(bytes[offset + 11])
+        offset += payloadSize
+        let userVersion = (userHigh << 8) | userLow
+        if version.allSatisfy({ $0 == 0xFF }) {
+            return .incomplete(userVersion)
+        }
+        return Versionstamp(transactionVersion: version, userVersion: userVersion)
     }
 }
 
