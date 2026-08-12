@@ -51,5 +51,8 @@ import SwiftProtobuf
 ///
 /// Stored in each record store's header so the store can detect data written by an
 /// incompatible future version of the layer.
-public let recordLayerFormatVersion = 1
+/// - 1: initial format.
+/// - 2: record versions and `version` index entries carry a 2-byte local version after the
+///   commit versionstamp (see ``FDBRecordVersion``), widening both from 10 to 12 bytes.
+public let recordLayerFormatVersion = 2
 #endif

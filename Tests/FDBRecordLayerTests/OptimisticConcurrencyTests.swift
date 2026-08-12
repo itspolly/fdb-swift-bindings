@@ -90,6 +90,54 @@ struct OptimisticConcurrencyTests {
         }
     }
 
+    @Test("records saved in one transaction get distinct, save-ordered versions")
+    func localVersionDistinguishesSameTransactionSaves() async throws {
+        try await RecordLayerTestCase.withStore(metaData: meta()) { run in
+            try await run { store in
+                _ = try await store.save(Fdb_Test_Order.sample(id: 1, price: 10))
+                _ = try await store.save(Fdb_Test_Order.sample(id: 2, price: 20))
+            }
+            let (first, second) = try await run { store in
+                (try await store.load(Fdb_Test_Order.self, Int64(1))?.version,
+                 try await store.load(Fdb_Test_Order.self, Int64(2))?.version)
+            }
+            let v1 = try #require(first)
+            let v2 = try #require(second)
+
+            // Same commit versionstamp, different local versions in save order.
+            #expect(v1.globalVersion == v2.globalVersion)
+            #expect(v1.localVersion == 0)
+            #expect(v2.localVersion == 1)
+            #expect(v1 != v2)
+            #expect(v1.bytes.count == 12)
+            // Big-endian local version ⇒ byte order is version order.
+            #expect(v1.bytes.lexicographicallyPrecedes(v2.bytes))
+        }
+    }
+
+    @Test("a re-save in a later transaction outranks an earlier local version")
+    func globalVersionDominatesLocalVersion() async throws {
+        try await RecordLayerTestCase.withStore(metaData: meta()) { run in
+            // Record 2 gets local version 1 here...
+            try await run { store in
+                _ = try await store.save(Fdb_Test_Order.sample(id: 1, price: 10))
+                _ = try await store.save(Fdb_Test_Order.sample(id: 2, price: 20))
+            }
+            // ...and record 1 is rewritten in a *later* transaction, taking local version 0
+            // again. The newer commit versionstamp must still sort it last.
+            try await run { _ = try await $0.save(Fdb_Test_Order.sample(id: 1, price: 11)) }
+
+            let (first, second) = try await run { store in
+                (try await store.load(Fdb_Test_Order.self, Int64(1))?.version,
+                 try await store.load(Fdb_Test_Order.self, Int64(2))?.version)
+            }
+            let v1 = try #require(first)
+            let v2 = try #require(second)
+            #expect(v1.localVersion == 0)
+            #expect(v2.bytes.lexicographicallyPrecedes(v1.bytes))
+        }
+    }
+
     /// Runs a conditional delete and reports whether it failed with `.versionMismatch`.
     private func deleteMismatches(_ run: StoreRunner, _ primaryKey: Tuple, ifVersionMatches expected: FDBRecordVersion?) async throws -> Bool {
         do {

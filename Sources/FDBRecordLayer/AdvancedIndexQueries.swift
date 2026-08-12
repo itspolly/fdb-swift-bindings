@@ -121,8 +121,9 @@ extension FDBRecordStore {
         let index = try erasedIndex(type, named: name)
         let entriesSubspace = indexesSubspace.child(Int64(index.subspaceKey)).child(Int64(0))
         let (begin, end) = entriesSubspace.range
-        // Each entry key is: entriesPrefix + <10-byte versionstamp> + <encoded primary key>.
-        let primaryKeyOffset = entriesSubspace.prefix.count + 10
+        // Each entry key is: entriesPrefix + <12-byte version> + <encoded primary key>.
+        let primaryKeyOffset = entriesSubspace.prefix.count
+            + FDBRecordVersion.globalVersionLength + FDBRecordVersion.localVersionLength
         let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
         let tx = transaction
         let recordName = recordType.recordName

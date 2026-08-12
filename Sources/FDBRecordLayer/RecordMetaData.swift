@@ -167,6 +167,12 @@ struct ErasedRecordType: Sendable {
     let primaryKeyIdentities: [FieldID?]
     let deserialize: @Sendable ([UInt8]) throws -> any SwiftProtobuf.Message
     var indexes: [ErasedIndex]
+
+    /// Whether saving a record of this type must claim a local version — either because the
+    /// record stores its own version, or because a `version` index stamps an entry for it.
+    var needsLocalVersion: Bool {
+        storesVersions || indexes.contains { $0.type == .version }
+    }
 }
 
 // MARK: - Result builder

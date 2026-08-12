@@ -92,18 +92,25 @@ struct AggregateIndexMaintainer: IndexMaintainer {
     }
 }
 
-/// Maintains a version index, ordering records by the transaction commit versionstamp.
+/// Maintains a version index, ordering records by their ``FDBRecordVersion``.
 ///
 /// Layout under the index subspace `I`:
-/// - `I / 0 / <10-byte versionstamp> / <primaryKey...>` → ∅  (the ordered entries)
-/// - `I / 1 / <primaryKey...>` → `<10-byte versionstamp>`   (reverse map, for update/delete)
+/// - `I / 0 / <12-byte version> / <primaryKey...>` → ∅  (the ordered entries)
+/// - `I / 1 / <primaryKey...>` → `<12-byte version>`   (reverse map, for update/delete)
 ///
-/// The versionstamp is filled in atomically at commit via `setVersionstampedKey` /
-/// `setVersionstampedValue`. The reverse map lets a later transaction find and clear the
-/// previous entry when a record is updated or deleted (the versionstamp isn't known until the
-/// original transaction committed, so it can't be derived locally).
+/// A version is the commit versionstamp followed by the record's local version, so records
+/// saved in the same transaction — which share a versionstamp — still sort by save order rather
+/// than arbitrarily by primary key.
+///
+/// The versionstamp half is filled in atomically at commit via `setVersionstampedKey` /
+/// `setVersionstampedValue`; the local version is written directly, since it is already known.
+/// The reverse map lets a later transaction find and clear the previous entry when a record is
+/// updated or deleted (the versionstamp isn't known until the original transaction committed, so
+/// it can't be derived locally).
 struct VersionIndexMaintainer: IndexMaintainer {
-    private static let versionstampLength = 10
+    let indexName: String
+    /// The saved record's local version. `nil` on a delete, which only clears entries.
+    let localVersion: Int?
 
     func update(
         transaction: any TransactionProtocol,
@@ -130,16 +137,20 @@ struct VersionIndexMaintainer: IndexMaintainer {
             transaction.clear(key: refKey)
             return
         }
+        guard let localVersion else {
+            throw RecordStoreError.missingLocalVersion(index: indexName)
+        }
 
-        // Write the new versionstamped entry: prefix + <stamp placeholder> + pk + offsetLE.
-        let placeholder = FDB.Bytes(repeating: 0, count: Self.versionstampLength)
+        // Write the new versioned entry: prefix + <incomplete version> + pk + offsetLE. The
+        // offset points at the versionstamp placeholder, which precedes the local version.
+        let incompleteVersion = FDBRecordVersion.incompleteBytes(localVersion: localVersion)
         let entryKeyPrefix = entriesSubspace.prefix
-        var stampedKey = entryKeyPrefix + placeholder + primaryKeyEncoded
+        var stampedKey = entryKeyPrefix + incompleteVersion + primaryKeyEncoded
         stampedKey += littleEndian32(UInt32(entryKeyPrefix.count))
         transaction.atomicOp(key: stampedKey, param: [], mutationType: .setVersionstampedKey)
 
-        // Write/refresh the reverse map: refKey -> versionstamp (offset 0 within the value).
-        var stampedValue = placeholder
+        // Write/refresh the reverse map: refKey -> version (stamp at offset 0 within the value).
+        var stampedValue = incompleteVersion
         stampedValue += littleEndian32(0)
         transaction.atomicOp(key: refKey, param: stampedValue, mutationType: .setVersionstampedValue)
     }

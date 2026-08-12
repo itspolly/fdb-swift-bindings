@@ -23,18 +23,53 @@ import FoundationDB
 import SwiftProtobuf
 
 /// A record's version: the commit versionstamp assigned by FoundationDB when the record was
-/// last written.
+/// last written, plus a counter distinguishing records written by the same transaction.
 ///
-/// Monotonic and unique per committing transaction, so it changes every time the record is
-/// saved — an opaque optimistic-concurrency token (an ETag). Populated on `load` for record
-/// types that opt in via ``RecordType/storingVersions(_:)``, and compared by
-/// ``FDBRecordStore/save(_:ifVersionMatches:)``.
+/// The 12-byte layout matches the Java Record Layer:
+///
+/// ```
+/// | 0 ..< 10                     | 10 ..< 12                  |
+/// | commit versionstamp (global) | local version (big-endian) |
+/// ```
+///
+/// The global half is assigned by FoundationDB at commit and is monotonic across transactions;
+/// the local half is claimed from ``FDBRecordContext`` per saved record, so two records saved in
+/// *one* transaction still receive distinct, save-ordered versions. Because the local version is
+/// big-endian and trails the versionstamp, plain lexicographic byte order is version order.
+///
+/// A version changes every time the record is saved — an opaque optimistic-concurrency token (an
+/// ETag). Populated on `load` for record types that opt in via ``RecordType/storingVersions(_:)``,
+/// and compared by ``FDBRecordStore/save(_:ifVersionMatches:)``.
 public struct FDBRecordVersion: Sendable, Hashable {
-    /// The raw version bytes (a FoundationDB versionstamp).
+    /// Byte length of the FoundationDB commit versionstamp that opens a version.
+    public static let globalVersionLength = 10
+    /// Byte length of the trailing local-version counter.
+    public static let localVersionLength = 2
+
+    /// The raw version bytes: a 10-byte versionstamp followed by the 2-byte local version.
     public let bytes: FDB.Bytes
 
     public init(bytes: FDB.Bytes) {
         self.bytes = bytes
+    }
+
+    /// The commit versionstamp half — equal for every record written by the same transaction.
+    public var globalVersion: FDB.Bytes {
+        Array(bytes.prefix(Self.globalVersionLength))
+    }
+
+    /// The within-transaction counter half, or `nil` for versions that predate it.
+    public var localVersion: Int? {
+        let tail = bytes.dropFirst(Self.globalVersionLength)
+        guard tail.count == Self.localVersionLength else { return nil }
+        return tail.reduce(0) { $0 << 8 | Int($1) }
+    }
+
+    /// The value written before commit: a zeroed versionstamp placeholder that FoundationDB
+    /// overwrites in place, followed by the already-known local version.
+    static func incompleteBytes(localVersion: Int) -> FDB.Bytes {
+        FDB.Bytes(repeating: 0, count: globalVersionLength)
+            + withUnsafeBytes(of: UInt16(localVersion).bigEndian) { Array($0) }
     }
 }
 

@@ -49,6 +49,11 @@ public enum RecordStoreError: Error, Sendable {
     case recordAlreadyExists(String)
     /// `update(_:)` found no existing record with the given primary key.
     case recordDoesNotExist(String)
+    /// More than 65,536 versioned records were written in a single transaction, exhausting the
+    /// 2-byte local-version counter that keeps their versions distinct.
+    case localVersionExhausted
+    /// A `version` index was asked to write an entry without a local version to stamp it with.
+    case missingLocalVersion(index: String)
 }
 
 /// The primary entry point for storing, retrieving, and querying records.
@@ -193,11 +198,15 @@ public final class FDBRecordStore: Sendable {
         let serialized: [UInt8] = try record.serializedBytes()
         transaction.setValue(serialized, for: recordKey)
 
+        // One local version per saved record, shared by the record's own version and its
+        // version-index entry so the two always agree.
+        let localVersion = try recordType.needsLocalVersion ? claimLocalVersion() : nil
+
         for index in recordType.indexes where indexState(named: index.name) != .disabled {
             let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
             let oldEntries = oldMessage.map { index.entries($0) } ?? []
             let newEntries = index.entries(record)
-            try await indexMaintainer(for: index).update(
+            try await indexMaintainer(for: index, localVersion: localVersion).update(
                 transaction: transaction,
                 indexSubspace: indexSubspace,
                 oldEntries: oldEntries,
@@ -206,8 +215,9 @@ public final class FDBRecordStore: Sendable {
             )
         }
 
-        if recordType.storesVersions {
-            stampVersion(recordType: recordType, primaryKeyEncoded: primaryKeyEncoded)
+        if recordType.storesVersions, let localVersion {
+            stampVersion(
+                recordType: recordType, primaryKeyEncoded: primaryKeyEncoded, localVersion: localVersion)
         }
 
         return FDBStoredRecord(recordType: recordType.recordName, primaryKey: Tuple(primaryKeyColumns), record: record)
@@ -426,11 +436,14 @@ public final class FDBRecordStore: Sendable {
             limit: batchSize, snapshot: false)
 
         let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
-        let maintainer = try indexMaintainer(for: index)
         var lastPrimaryKeyEncoded: FDB.Bytes?
         for (key, value) in batch.records {
             let primaryKeyEncoded = Array(key.dropFirst(typeSubspace.prefix.count))
             let message = try recordType.deserialize(value)
+            // A fresh local version per record keeps backfilled entries distinct and ordered
+            // within the build transaction's single commit versionstamp.
+            let maintainer = try indexMaintainer(
+                for: index, localVersion: index.type == .version ? claimLocalVersion() : nil)
             try await maintainer.update(
                 transaction: transaction,
                 indexSubspace: indexSubspace,
@@ -456,7 +469,17 @@ public final class FDBRecordStore: Sendable {
 
     // MARK: - Internals
 
-    func indexMaintainer(for index: ErasedIndex) throws -> any IndexMaintainer {
+    /// Claims the next local version for this transaction, rejecting a counter that no longer
+    /// fits the 2 bytes reserved for it in ``FDBRecordVersion``.
+    private func claimLocalVersion() throws -> Int {
+        let localVersion = context.nextLocalVersion()
+        guard localVersion <= Int(UInt16.max) else { throw RecordStoreError.localVersionExhausted }
+        return localVersion
+    }
+
+    /// - Parameter localVersion: the record's local version, for maintainers that stamp entries
+    ///   with it. `nil` when nothing is being written (a delete) or the type has no versions.
+    func indexMaintainer(for index: ErasedIndex, localVersion: Int? = nil) throws -> any IndexMaintainer {
         switch index.type {
         case .value, .rank, .min, .max:
             // These all store ordered (columns..., primaryKey) entries like a value index.
@@ -470,7 +493,7 @@ public final class FDBRecordStore: Sendable {
         case .count, .sum:
             return AggregateIndexMaintainer(kind: index.type)
         case .version:
-            return VersionIndexMaintainer()
+            return VersionIndexMaintainer(indexName: index.name, localVersion: localVersion)
         }
     }
 
@@ -503,11 +526,14 @@ public final class FDBRecordStore: Sendable {
     }
 
     /// Stamps the record's version with this transaction's commit versionstamp (resolved at
-    /// commit). A 10-byte placeholder plus a little-endian offset of 0 tells FoundationDB to
-    /// write the versionstamp as the whole value.
-    private func stampVersion(recordType: ErasedRecordType, primaryKeyEncoded: FDB.Bytes) {
-        let placeholder = FDB.Bytes(repeating: 0, count: 10)
-        let param = placeholder + withUnsafeBytes(of: UInt32(0).littleEndian) { Array($0) }
+    /// commit) followed by `localVersion`. The 12-byte value plus a little-endian offset of 0
+    /// tells FoundationDB to overwrite bytes 0..<10 with the versionstamp, leaving the local
+    /// version — already known — in place.
+    private func stampVersion(
+        recordType: ErasedRecordType, primaryKeyEncoded: FDB.Bytes, localVersion: Int
+    ) {
+        let param = FDBRecordVersion.incompleteBytes(localVersion: localVersion)
+            + withUnsafeBytes(of: UInt32(0).littleEndian) { Array($0) }
         transaction.atomicOp(
             key: versionKey(recordType: recordType, primaryKeyEncoded: primaryKeyEncoded),
             param: param,

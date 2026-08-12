@@ -117,6 +117,29 @@ struct AdvancedIndexTests {
         }
     }
 
+    @Test("version index orders records saved in one transaction by save order")
+    func versionIndexWithinTransaction() async throws {
+        try await withAdvancedStore { run in
+            // A single transaction: all three share one commit versionstamp, so only the local
+            // version distinguishes them. Saved in an order that is neither ascending nor
+            // descending by primary key, so a primary-key tiebreak would show up either way.
+            try await run { store in
+                try await store.save(Fdb_Test_Order.sample(id: 20))
+                try await store.save(Fdb_Test_Order.sample(id: 30))
+                try await store.save(Fdb_Test_Order.sample(id: 10))
+            }
+
+            let order = try await run { store in
+                var ids: [Int64] = []
+                for try await record in try store.scanByVersion(Fdb_Test_Order.self, indexNamed: "order.version") {
+                    ids.append(record.record.orderID)
+                }
+                return ids
+            }
+            #expect(order == [20, 30, 10])
+        }
+    }
+
     @Test("min/max indexes report grouped extrema and recompute correctly on delete")
     func minMax() async throws {
         try await withAdvancedStore { run in
