@@ -22,6 +22,7 @@
 import Foundation
 import FoundationDB
 import SwiftProtobuf
+import Synchronization
 
 /// Errors raised by ``FDBRecordStore``.
 public enum RecordStoreError: Error, Sendable {
@@ -60,7 +61,14 @@ public enum RecordStoreError: Error, Sendable {
 /// - `S / 0 / ...` — store header (format + metadata versions)
 /// - `S / 1 / <typeKey> / <primaryKey...>` → serialized record bytes
 /// - `S / 2 / <indexKey> / <indexColumns...> / <primaryKey...>` → index entry
-public final class FDBRecordStore {
+///
+/// A store is `Sendable`: everything it holds is immutable apart from the index-state cache,
+/// which is mutex-guarded, and the underlying transaction, which is itself `Sendable`. Sharing
+/// one store across concurrent tasks is therefore memory-safe — but it does not serialize the
+/// operations themselves. Read-modify-write calls (``save(_:)``, ``insert(_:)``, ``delete(_:primaryKey:)``)
+/// read the prior record before writing, so two of them racing on the same primary key within one
+/// transaction can still lose an index update. Keep concurrent work on disjoint records.
+public final class FDBRecordStore: Sendable {
     /// The transaction context the store operates in.
     public let context: FDBRecordContext
     /// The subspace the store occupies.
@@ -75,8 +83,9 @@ public final class FDBRecordStore {
 
     var transaction: any TransactionProtocol { context.transaction }
 
-    /// Per-index build state, resolved when the store is opened.
-    private var indexStates: [String: IndexState] = [:]
+    /// Per-index build state, resolved when the store is opened. Guarded so the store stays
+    /// `Sendable`; index builds mutate it mid-transaction.
+    private let indexStates = Mutex<[String: IndexState]>([:])
 
     private var formatVersionKey: FDB.Bytes { storeInfoSubspace.pack("format_version") }
     private var metaDataVersionKey: FDB.Bytes { storeInfoSubspace.pack("metadata_version") }
@@ -85,7 +94,7 @@ public final class FDBRecordStore {
 
     /// The build state of the named index (defaults to `.readable` for unknown names).
     public func indexState(named name: String) -> IndexState {
-        indexStates[name] ?? .readable
+        indexStates.withLock { $0[name] } ?? .readable
     }
 
     /// The names of indexes currently usable by queries (readable).
@@ -148,7 +157,7 @@ public final class FDBRecordStore {
             for index in recordType.indexes {
                 if let stored = try await transaction.getValue(for: indexStateKey(index.name)),
                    let raw = Self.decodeInt(stored), let state = IndexState(rawValue: Int(raw)) {
-                    indexStates[index.name] = state
+                    indexStates.withLock { $0[index.name] = state }
                     continue
                 }
                 let (begin, end) = recordsSubspace.child(Int64(recordType.typeKey)).range
@@ -157,7 +166,7 @@ public final class FDBRecordStore {
                     limit: 1, snapshot: false)
                 let state: IndexState = firstBatch.records.isEmpty ? .readable : .writeOnly
                 transaction.setValue(Self.encodeInt(state.rawValue), for: indexStateKey(index.name))
-                indexStates[index.name] = state
+                indexStates.withLock { $0[index.name] = state }
             }
         }
     }
@@ -393,7 +402,7 @@ public final class FDBRecordStore {
         transaction.clearRange(beginKey: begin, endKey: end)
         transaction.clear(key: indexStateKey(name))
         transaction.clear(key: buildProgressKey(name))
-        indexStates.removeValue(forKey: name)
+        indexStates.withLock { _ = $0.removeValue(forKey: name) }
     }
 
     // MARK: - Index building
@@ -441,7 +450,7 @@ public final class FDBRecordStore {
         // Done: the index is now fully populated and usable by queries.
         transaction.setValue(Self.encodeInt(IndexState.readable.rawValue), for: indexStateKey(name))
         transaction.clear(key: buildProgressKey(name))
-        indexStates[name] = .readable
+        indexStates.withLock { $0[name] = .readable }
         return true
     }
 

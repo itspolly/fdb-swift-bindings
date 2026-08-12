@@ -20,6 +20,7 @@
 
 #if RecordLayer
 import FoundationDB
+import Synchronization
 
 /// A transaction-scoped handle through which record stores operate.
 ///
@@ -36,13 +37,16 @@ import FoundationDB
 ///     _ = try await store.save(order)
 /// }
 /// ```
-public final class FDBRecordContext {
+/// A context is `Sendable`: the transaction it wraps is itself `Sendable`, so the same context
+/// (and stores opened on it) may be shared by concurrent tasks within one transaction.
+public final class FDBRecordContext: Sendable {
     /// The underlying transaction. Reads/writes issued here join the context's transaction.
     public let transaction: any TransactionProtocol
 
     /// Monotonic counter used to disambiguate multiple record versions written in one
-    /// transaction (see version indexes).
-    private var versionCounter: Int = 0
+    /// transaction (see version indexes). Atomic so concurrent tasks sharing the context
+    /// cannot hand out the same local version twice.
+    private let versionCounter = Atomic<Int>(0)
 
     /// Wraps an existing transaction in a record context.
     public init(transaction: any TransactionProtocol) {
@@ -51,8 +55,7 @@ public final class FDBRecordContext {
 
     /// Returns the next local version number within this transaction.
     func nextLocalVersion() -> Int {
-        defer { versionCounter += 1 }
-        return versionCounter
+        versionCounter.wrappingAdd(1, ordering: .relaxed).oldValue
     }
 
     /// Commits the underlying transaction.
