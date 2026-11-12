@@ -476,6 +476,13 @@ private func shortName(_ fullName: String) -> String {
 // MARK: - RecordMetaData → MetaData
 
 extension RecordMetaData {
+    /// Serializes the metadata as Java's `MetaData` using its own descriptors: the attached
+    /// ``descriptorSet`` if any, else descriptors reconstructed from the generated Swift message
+    /// types (see ``ProtoReflection``) — so no `protoc` output is needed.
+    public func toProto() throws -> Data {
+        try toProto(descriptorSet: effectiveDescriptorSet())
+    }
+
     /// Serializes the metadata as Java's `RecordMetaDataProto.MetaData`, loadable by Java's
     /// `RecordMetaData.build(MetaData)` (and by ``init(metaDataProto:recordTypes:)``).
     ///
@@ -1088,7 +1095,7 @@ extension RecordMetaData {
         func build<M: SwiftProtobuf.Message>(_: M.Type) -> ErasedRecordType {
             let probe = primaryKey.evaluate(M()).first ?? []
             return ErasedRecordType(
-                recordName: M.protoMessageName, explicitKey: explicitKey, explicitUnionField: unionField,
+                recordName: M.protoMessageName, messageType: M.self, explicitKey: explicitKey, explicitUnionField: unionField,
                 sinceVersion: sinceVersion, storesVersions: storesVersions,
                 primaryKeyStartsWithRecordType: probe.first is RecordTypeKeyPlaceholder,
                 rawPrimaryKey: { primaryKey.evaluate($0).first ?? [] },

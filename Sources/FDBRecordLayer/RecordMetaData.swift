@@ -150,6 +150,7 @@ public struct RecordType<M: SwiftProtobuf.Message>: ErasableRecordType, Sendable
         let probe = pk.evaluate(M()).first ?? []
         return ErasedRecordType(
             recordName: recordName,
+            messageType: M.self,
             explicitKey: key,
             explicitUnionField: unionField,
             sinceVersion: sinceVersion,
@@ -218,6 +219,9 @@ struct ErasedIndex: Sendable {
 /// Internal, type-erased view of a ``RecordType`` used by the store.
 struct ErasedRecordType: Sendable {
     let recordName: String
+    /// The generated Swift type of the record message, when known (used to reconstruct
+    /// descriptors by reflection).
+    let messageType: (any SwiftProtobuf.Message.Type)?
     /// Caller-supplied record type key, if any.
     let explicitKey: Int?
     /// Caller-supplied union field number, if any.
@@ -246,7 +250,8 @@ struct ErasedRecordType: Sendable {
     var primaryKeyNode: KeyExpressionNode
 
     init(
-        recordName: String, explicitKey: Int?, explicitUnionField: Int?, sinceVersion: Int?,
+        recordName: String, messageType: (any SwiftProtobuf.Message.Type)? = nil,
+        explicitKey: Int?, explicitUnionField: Int?, sinceVersion: Int?,
         storesVersions: Bool, primaryKeyStartsWithRecordType: Bool,
         rawPrimaryKey: @escaping @Sendable (any SwiftProtobuf.Message) -> [any TupleElement],
         primaryKeyColumnIdentities: [FieldID?],
@@ -254,6 +259,7 @@ struct ErasedRecordType: Sendable {
         indexes: [ErasedIndex], primaryKeyNode: KeyExpressionNode = .opaque
     ) {
         self.recordName = recordName
+        self.messageType = messageType
         self.explicitKey = explicitKey
         self.explicitUnionField = explicitUnionField
         self.sinceVersion = sinceVersion
@@ -355,6 +361,17 @@ public struct RecordMetaData: Sendable {
     /// Java metadata, or supplied with ``withDescriptorSet(_:)``). Field names in Java-format
     /// key expressions (e.g. the header's record count key) come from it.
     public private(set) var descriptorSet: Data? = nil
+
+    /// The descriptor set to use for field names and Java metadata: the attached one, else one
+    /// reconstructed from the generated Swift message types by reflection (``ProtoReflection``).
+    func effectiveDescriptorSet() throws -> Data {
+        if let descriptorSet { return descriptorSet }
+        let types = recordTypes.compactMap(\.messageType)
+        guard types.count == recordTypes.count else {
+            throw ProtoReflectionError.unsupported("record types without a known Swift message type")
+        }
+        return try ProtoReflection.fileDescriptorSet(for: types).serializedData()
+    }
 
     /// The same metadata with a descriptor set for the record messages attached.
     public func withDescriptorSet(_ data: Data) -> RecordMetaData {

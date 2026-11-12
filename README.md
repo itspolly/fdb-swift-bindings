@@ -404,6 +404,16 @@ let meta = RecordMetaData(joinedRecordTypes: [orderItems]) { ... }
 disabled. Hot stores can cache their header and index states across transactions with
 `store.setStateCacheability(true)` plus a shared `RecordStoreStateCache` passed to `open`.
 
+### Java metadata and text search paging
+
+`meta.toProto()` writes Java's `MetaData` proto, and `RecordMetaData(metaDataProto:recordTypes:)`
+loads one. No `protoc` output is needed: descriptors are reconstructed from the generated Swift
+message types (field names, numbers, types, labels and nesting match protoc's). Attach the real
+descriptors with `withDescriptorSet(_:)` to carry comments, options and oneof grouping too.
+
+Text searches page with `limit:` and `continuation:` (`textSearchPrimaryKeys`, `textSearch`,
+`scanTextIndex`); each page reads only what it returns.
+
 ### Stores written by earlier versions of this package
 
 Stores written before the Java-compatible layout must be migrated once; opening one fails with

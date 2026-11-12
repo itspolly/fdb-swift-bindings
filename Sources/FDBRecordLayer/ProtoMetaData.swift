@@ -185,6 +185,7 @@ private func makeErasedRecordType(
         let indexInfos = info.indexes
         return ErasedRecordType(
             recordName: M.protoMessageName,
+            messageType: M.self,
             explicitKey: nil,
             explicitUnionField: nil,
             sinceVersion: nil,

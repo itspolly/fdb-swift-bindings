@@ -1283,7 +1283,7 @@ extension FDBRecordStore {
 
     // MARK: Internals
 
-    private func checkTextIndex(_ index: ErasedIndex, group: Tuple) throws {
+    func checkTextIndex(_ index: ErasedIndex, group: Tuple) throws {
         guard index.type == .text else { throw TextIndexError.invalidQuery("index \(index.name) is not a text index") }
         let columns = index.columnIdentities.count
         if columns > 0 {
@@ -1296,7 +1296,7 @@ extension FDBRecordStore {
     }
 
     /// The comparand's tokens (Java's `TextScan.getTokenList`).
-    private func textTokens(_ index: ErasedIndex, _ comparison: TextComparison, removeStopWords: Bool) throws -> [String] {
+    func textTokens(_ index: ErasedIndex, _ comparison: TextComparison, removeStopWords: Bool) throws -> [String] {
         var tokens: [String]
         switch comparison.comparand {
         case .tokens(let list):

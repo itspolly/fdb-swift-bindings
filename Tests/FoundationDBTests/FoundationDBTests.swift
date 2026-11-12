@@ -18,6 +18,7 @@
  * limitations under the License.
  */
 
+import Foundation
 import Testing
 
 @testable import FoundationDB
@@ -1669,26 +1670,25 @@ func addMultipleConflictRanges() async throws {
     try await FDBClient.maybeInitialize()
     let database = try FDBClient.openDatabase()
 
-    // Clear test key range
-    let clearTransaction = try database.createTransaction()
-    clearTransaction.clearRange(beginKey: "test_multi_", endKey: "test_multi`")
-    _ = try await clearTransaction.commit()
+    // A unique prefix outside "test_": other tests clear "test_"…"test`" concurrently, and a
+    // read conflict range overlapping such a clear would (correctly) fail this commit.
+    let prefix = "conflict_multi_\(UUID().uuidString)_"
 
     // Test adding multiple conflict ranges
     let transaction = try database.createTransaction()
 
     // Add multiple read conflict ranges
-    let beginKey1: FDB.Bytes = Array("test_multi_a".utf8)
-    let endKey1: FDB.Bytes = Array("test_multi_b".utf8)
+    let beginKey1: FDB.Bytes = Array((prefix + "a").utf8)
+    let endKey1: FDB.Bytes = Array((prefix + "b").utf8)
     try transaction.addConflictRange(beginKey: beginKey1, endKey: endKey1, type: .read)
 
-    let beginKey2: FDB.Bytes = Array("test_multi_c".utf8)
-    let endKey2: FDB.Bytes = Array("test_multi_d".utf8)
+    let beginKey2: FDB.Bytes = Array((prefix + "c").utf8)
+    let endKey2: FDB.Bytes = Array((prefix + "d").utf8)
     try transaction.addConflictRange(beginKey: beginKey2, endKey: endKey2, type: .read)
 
     // Add write conflict range
-    let beginKey3: FDB.Bytes = Array("test_multi_x".utf8)
-    let endKey3: FDB.Bytes = Array("test_multi_y".utf8)
+    let beginKey3: FDB.Bytes = Array((prefix + "x").utf8)
+    let endKey3: FDB.Bytes = Array((prefix + "y").utf8)
     try transaction.addConflictRange(beginKey: beginKey3, endKey: endKey3, type: .write)
 
     // Should be able to commit with multiple conflict ranges

@@ -23,13 +23,14 @@ import FoundationDB
 
 /// Encodes the record count key stored in the header (`DataStoreInfo.record_count_key`).
 ///
-/// With descriptors (``RecordMetaData/descriptorSet``) this is Java's `KeyExpression` proto, so
-/// Java and Swift clients agree on whether counts must be rebuilt. Without them field names are
-/// unknown, and a Swift-only encoding is used: a Java client would see a different key and
-/// rebuild the counts once.
+/// This is Java's `KeyExpression` proto, so Java and Swift clients agree on whether counts must be
+/// rebuilt. Field names come from the metadata's descriptors — attached, or reconstructed from
+/// the generated message types. Only if neither is possible (e.g. a map field defeats
+/// reconstruction) is a Swift-only encoding used, after which a Java client rebuilds the
+/// counts once.
 enum RecordCountKeyCodec {
     static func encode(_ node: KeyExpressionNode, metaData: RecordMetaData) -> FDB.Bytes {
-        if let descriptors = metaData.descriptorSet {
+        if let descriptors = try? metaData.effectiveDescriptorSet() {
             let names = metaData.recordTypes.compactMap {
                 try? KeyExpressionProto.FieldNames(descriptorSet: descriptors, messageName: $0.recordName)
             }
