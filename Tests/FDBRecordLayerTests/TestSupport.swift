@@ -129,9 +129,7 @@ struct StoreRunner {
 
     func cleanup() async throws {
         try await database.withRecordContext { context in
-            let store = try await FDBRecordStore.open(
-                context: context, subspace: subspace, metaData: metaData)
-            try await store.deleteAllRecords()
+            FDBRecordStore.deleteStore(context: context, subspace: subspace)
         }
     }
 }

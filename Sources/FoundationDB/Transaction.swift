@@ -285,12 +285,15 @@ public final class FDBTransaction: TransactionProtocol, @unchecked Sendable {
                         transaction,
                         beginKeyBytes.bindMemory(to: UInt8.self).baseAddress,
                         Int32(beginKey.count),
-                        1, // begin_or_equal = true
-                        0, // begin_offset = 0
+                        // firstGreaterOrEqual(beginKey): or_equal = 0, offset = 1. (The previous
+                        // (1, 0) was lastLessOrEqual, which included the key before `beginKey`.)
+                        0, // begin_or_equal
+                        1, // begin_offset
                         endKeyBytes.bindMemory(to: UInt8.self).baseAddress,
                         Int32(endKey.count),
-                        1, // end_or_equal = false (exclusive)
-                        0, // end_offset = 0
+                        // firstGreaterOrEqual(endKey): the range excludes `endKey`.
+                        0, // end_or_equal
+                        1, // end_offset
                         Int32(limit),
                         0, // target_bytes = 0 (no limit)
                         FDBStreamingMode(-1), // mode = FDB_STREAMING_MODE_ITERATOR

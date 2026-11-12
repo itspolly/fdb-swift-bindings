@@ -34,8 +34,8 @@ struct IndexBuildTests {
     }
 
     private func extendedMeta() -> RecordMetaData {
-        RecordMetaData {
-            RecordType(Fdb_Test_Order.self, primaryKey: \.orderID).index("priceIdx", on: \.price)
+        RecordMetaData(version: 2) {
+            RecordType(Fdb_Test_Order.self, primaryKey: \.orderID).index("priceIdx", on: \.price, addedVersion: 2)
         }
     }
 
@@ -53,12 +53,13 @@ struct IndexBuildTests {
             }
         }
 
-        // Reopen with the price index declared → it should be writeOnly.
+        // Reopen with the price index declared → on a non-empty store it is disabled (Java's
+        // default), to be built online.
         let stateBefore = try await db.withRecordContext { context in
             let store = try await FDBRecordStore.open(context: context, subspace: subspace, metaData: extendedMeta())
             return store.indexState(named: "priceIdx")
         }
-        #expect(stateBefore == .writeOnly)
+        #expect(stateBefore == .disabled)
 
         // A covering query must fail while the index is not readable.
         var threwBeforeBuild = false
@@ -74,7 +75,9 @@ struct IndexBuildTests {
         #expect(threwBeforeBuild)
 
         // Build the index online, in small batches (exercises the resume loop).
-        try await db.buildIndex(subspace: subspace, metaData: extendedMeta(), indexName: "priceIdx", batchSize: 2)
+        var config = OnlineIndexer.Config()
+        config.maxLimit = 2
+        try await db.buildIndex(subspace: subspace, metaData: extendedMeta(), indexName: "priceIdx", config: config)
 
         // Now readable, and the backfilled existing records are covered by the index.
         let (stateAfter, covered) = try await db.withRecordContext { context in

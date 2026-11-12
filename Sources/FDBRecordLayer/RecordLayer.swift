@@ -47,12 +47,54 @@
 #if RecordLayer
 import SwiftProtobuf
 
-/// Marker for the current Record Layer source format version.
+/// The store format version this implementation writes: Java's
+/// `FormatVersion.FULL_STORE_LOCK` (14). See ``FormatVersion``.
+public let recordLayerFormatVersion = FormatVersion.current.rawValue
+
+/// The Java Record Layer's `FormatVersion`: a monotonically increasing number in each store's
+/// header recording which on-disk features the store may use.
 ///
-/// Stored in each record store's header so the store can detect data written by an
-/// incompatible future version of the layer.
-/// - 1: initial format.
-/// - 2: record versions and `version` index entries carry a 2-byte local version after the
-///   commit versionstamp (see ``FDBRecordVersion``), widening both from 10 to 12 bytes.
-public let recordLayerFormatVersion = 2
+/// This implementation reads and writes stores up to ``current``. Opening a store whose header
+/// carries a higher version fails, exactly as the Java layer refuses stores from a newer client.
+/// Stores below ``minimumSupported`` predate features this implementation relies on (records
+/// carrying a split suffix, versions stored beside records) and are refused rather than read
+/// in a legacy mode.
+public enum FormatVersion: Int, Sendable, Comparable, CaseIterable {
+    case infoAdded = 1
+    case recordCountAdded = 2
+    case recordCountKeyAdded = 3
+    case formatControl = 4
+    case saveUnsplitWithSuffix = 5
+    case saveVersionWithRecord = 6
+    case cacheableState = 7
+    case headerUserFields = 8
+    case readableUniquePending = 9
+    case checkIndexBuildTypeDuringUpdate = 10
+    case recordCountState = 11
+    case storeLockState = 12
+    case incarnation = 13
+    case fullStoreLock = 14
+
+    /// The version written to new stores and that existing stores are upgraded to on open.
+    public static let current: FormatVersion = .fullStoreLock
+    /// The oldest Java store format this implementation can open.
+    public static let minimumSupported: FormatVersion = .saveVersionWithRecord
+
+    public static func < (lhs: FormatVersion, rhs: FormatVersion) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+/// The top-level keyspaces of a record store's subspace — Java's `FDBRecordStoreKeyspace`.
+enum RecordStoreKeyspace: Int64, Sendable {
+    case storeInfo = 0
+    case record = 1
+    case index = 2
+    case indexSecondarySpace = 3
+    case recordCount = 4
+    case indexStateSpace = 5
+    case indexRangeSpace = 6
+    case indexUniquenessViolationsSpace = 7
+    case recordVersionSpace = 8
+    case indexBuildSpace = 9
+    case indexSlidingWindowSpace = 10
+}
 #endif

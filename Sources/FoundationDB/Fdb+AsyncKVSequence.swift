@@ -127,29 +127,14 @@ extension FDB {
 
             /// Current batch of records being served
             private var currentBatch: ResultRange = .init(records: [], more: true)
-            /// Index of next item to return from current batch
             private var currentIndex: Int = 0
-            /// Background task pre-fetching the next batch
-            private var preFetchTask: Task<ResultRange?, Error>?
+            /// Whether the first batch has been requested.
+            private var started = false
 
-            /// Returns `true` when all available data has been consumed
-            private var isExhausted: Bool {
-                currentBatchExhausted && !currentBatch.more
-            }
-
-            /// Returns `true` when current batch has no more items to serve
             private var currentBatchExhausted: Bool {
                 currentIndex >= currentBatch.records.count
             }
 
-            /// Initializes the iterator and immediately starts pre-fetching the first batch.
-            ///
-            /// - Parameters:
-            ///   - transaction: The transaction to use for range queries
-            ///   - beginSelector: Starting key selector for the range
-            ///   - endSelector: Ending key selector for the range (exclusive)
-            ///   - snapshot: Whether to use snapshot reads
-            ///   - batchLimit: Maximum items per batch (0 = FDB default)
             init(
                 transaction: TransactionProtocol, beginSelector: FDB.KeySelector,
                 endSelector: FDB.KeySelector, snapshot: Bool, reverse: Bool, batchLimit: Int
@@ -160,93 +145,43 @@ extension FDB {
                 self.batchLimit = batchLimit
                 self.snapshot = snapshot
                 self.reverse = reverse
-
-                // Start fetching immediately to minimize latency on first next() call
-                startBackgroundPreFetch()
             }
 
-            /// Returns the next key-value pair in the sequence.
-            ///
-            /// This method implements the core iteration logic with optimal performance:
-            ///
-            /// 1. If current batch has items, return next item immediately
-            /// 2. If current batch is exhausted, wait for pre-fetched batch
-            /// 3. Continue pre-fetching next batch in background
-            ///
-            /// The method only blocks on network I/O when transitioning between batches
-            /// and the next batch isn't ready yet.
-            ///
-            /// - Returns: The next key-value pair, or `nil` if sequence is exhausted
-            /// - Throws: `FDBError` if the database operation fails
+            /// Batches are fetched on demand, never ahead in the background: a read left running
+            /// when the caller stops iterating would still be outstanding at commit (failing it),
+            /// and a non-snapshot read would add a conflict range over keys the caller never saw.
             public mutating func next() async throws -> Element? {
-                if isExhausted {
-                    return nil
+                while currentBatchExhausted {
+                    if started && !currentBatch.more { return nil }
+                    try await fetchNextBatch()
+                    if currentBatch.records.isEmpty && !currentBatch.more { return nil }
                 }
-
-                if currentBatchExhausted {
-                    try await updateCurrentBatch()
-                }
-
-                if currentBatchExhausted {
-                    // If last fetch didn't bring any new records, we've read everything.
-                    return nil
-                }
-
                 let keyValue = currentBatch.records[currentIndex]
                 currentIndex += 1
                 return keyValue
             }
 
-            /// Updates the current batch with pre-fetched data and starts next pre-fetch.
-            ///
-            /// This method is called when the current batch is exhausted and we need to
-            /// move to the next batch. It waits for the background pre-fetch task to complete,
-            /// updates the iterator state, and starts pre-fetching the subsequent batch.
-            ///
-            /// - Throws: `FDBError` if the pre-fetch operation failed
-            private mutating func updateCurrentBatch() async throws {
-                guard let nextBatch = try await preFetchTask?.value else {
-                    throw FDBError(.clientError)
-                }
-
-                assert(currentIndex >= currentBatch.records.count)
-                currentBatch = nextBatch
+            private mutating func fetchNextBatch() async throws {
+                started = true
+                let batch = try await transaction.getRangeNative(
+                    beginSelector: nextBeginSelector,
+                    endSelector: nextEndSelector,
+                    limit: batchLimit,
+                    snapshot: snapshot,
+                    reverse: reverse
+                )
+                currentBatch = batch
                 currentIndex = 0
-
-                if !currentBatch.records.isEmpty, currentBatch.more {
+                if let lastKey = batch.records.last?.0, batch.more {
                     // `last` is the lowest key in a reverse batch and the highest otherwise, so
                     // reverse continues by retreating the (exclusive) end; forward by advancing begin.
-                    let lastKey = nextBatch.records.last!.0
                     if reverse {
                         nextEndSelector = FDB.KeySelector.firstGreaterOrEqual(lastKey)
                     } else {
                         nextBeginSelector = FDB.KeySelector.firstGreaterThan(lastKey)
                     }
-                    startBackgroundPreFetch()
-                } else {
-                    preFetchTask = nil
-                }
-            }
-
-            /// Starts background pre-fetching of the next batch.
-            ///
-            /// This method creates a background Task that performs the next range query
-            /// concurrently. The task captures all necessary values to avoid reference
-            /// cycles and ensure thread safety.
-            ///
-            /// The pre-fetch runs independently and can complete while the iterator
-            /// is serving items from the current batch, minimizing blocking time
-            /// during batch transitions.
-            private mutating func startBackgroundPreFetch() {
-                preFetchTask = Task {
-                    [transaction, nextBeginSelector, nextEndSelector, batchLimit, snapshot, reverse] in
-                    return try await transaction.getRangeNative(
-                        beginSelector: nextBeginSelector,
-                        endSelector: nextEndSelector,
-                        limit: batchLimit,
-                        snapshot: snapshot,
-                        reverse: reverse
-                    )
+                } else if batch.records.isEmpty {
+                    currentBatch = ResultRange(records: [], more: false)
                 }
             }
         }

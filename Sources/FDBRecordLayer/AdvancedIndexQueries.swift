@@ -22,40 +22,80 @@
 import FoundationDB
 import SwiftProtobuf
 
-extension FDBRecordStore {
-    // MARK: - Aggregate indexes (count / sum)
+/// Java's `RankedSetIndexHelper`: keeps a rank index's per-group ranked sets in step with its
+/// value entries.
+enum RankedSetIndexHelper {
+    /// Adds a score to, or removes it from, a group's ranked set. Without duplicate counting, a
+    /// score is only removed once no other record in the group still has it — the caller has
+    /// already cleared this record's value entry, so any remaining entry under the value belongs
+    /// to another record.
+    static func updateRankedSet(
+        _ tr: any TransactionProtocol, rankedSet: RankedSet, score: FDB.Bytes, remove: Bool,
+        valueRange: (begin: FDB.Bytes, end: FDB.Bytes), config: RankedSet.Config
+    ) async throws {
+        if try await rankedSet.initNeeded(tr, snapshot: true) {
+            try await rankedSet.`init`(tr)
+        }
+        if remove {
+            if config.countDuplicates {
+                _ = try await rankedSet.remove(tr, key: score)
+            } else {
+                let others = try await tr.getRangeNative(
+                    beginSelector: .firstGreaterOrEqual(valueRange.begin),
+                    endSelector: .firstGreaterOrEqual(valueRange.end), limit: 1, snapshot: false)
+                if others.records.isEmpty { _ = try await rankedSet.remove(tr, key: score) }
+            }
+        } else {
+            _ = try await rankedSet.add(tr, key: score)
+        }
+    }
+}
 
-    /// Reads a `count` or `sum` aggregate for a single group (empty tuple = the ungrouped total
-    /// when the index has no grouping columns).
+extension FDBRecordStore {
+    // MARK: - Aggregate (atomic) indexes
+
+    /// Reads a `count`, `count_updates`, `count_not_null`, `sum`, `min_ever_long` or
+    /// `max_ever_long` aggregate for one group (empty tuple = the ungrouped total). The index must
+    /// be scannable.
     public func aggregate<M: SwiftProtobuf.Message>(
         _ type: M.Type, indexNamed name: String, group: Tuple = Tuple()
     ) async throws -> Int64 {
-        let index = try erasedIndex(type, named: name)
-        let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
-        let key = indexSubspace.prefix + group.encode()
-        guard let bytes = try await transaction.getValue(for: key) else { return 0 }
-        return LittleEndianInt.value(bytes)
+        let index = try scannableIndex(type, named: name)
+        guard let bytes = try await transaction.getValue(for: indexSubspace(index).pack(group)) else { return 0 }
+        return IndexMaintainer.decodeLittleEndian(bytes)
     }
 
-    /// Sums every group's aggregate value — e.g. the grand total of a grouped `count`/`sum`.
+    /// Reads a `min_ever_tuple`, `max_ever_tuple` or `max_ever_version` aggregate for a group.
+    public func aggregateTuple<M: SwiftProtobuf.Message>(
+        _ type: M.Type, indexNamed name: String, group: Tuple = Tuple()
+    ) async throws -> Tuple? {
+        let index = try scannableIndex(type, named: name)
+        guard let bytes = try await transaction.getValue(for: indexSubspace(index).pack(group)) else { return nil }
+        return Tuple(try Tuple.decode(from: bytes))
+    }
+
+    /// Sums a long-valued aggregate over every group, reading at most `groupLimit` groups so the
+    /// read stays inside one transaction's limits. Returns the total and whether every group
+    /// was read.
     public func aggregateTotal<M: SwiftProtobuf.Message>(
-        _ type: M.Type, indexNamed name: String
-    ) async throws -> Int64 {
-        let index = try erasedIndex(type, named: name)
-        let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
-        let (begin, end) = indexSubspace.range
+        _ type: M.Type, indexNamed name: String, groupLimit: Int = 10_000
+    ) async throws -> (total: Int64, complete: Bool) {
+        let index = try scannableIndex(type, named: name)
+        let (begin, end) = indexSubspace(index).range
+        let result = try await transaction.getRangeNative(
+            beginSelector: .firstGreaterOrEqual(begin), endSelector: .firstGreaterOrEqual(end),
+            limit: groupLimit + 1, snapshot: false)
         var total: Int64 = 0
-        for try await (_, value) in transaction.getRange(beginKey: begin, endKey: end) {
-            total += LittleEndianInt.value(value)
+        for (_, value) in result.records.prefix(groupLimit) {
+            total &+= IndexMaintainer.decodeLittleEndian(value)
         }
-        return total
+        return (total, result.records.count <= groupLimit && !result.more)
     }
 
-    // MARK: - Min / max indexes
+    // MARK: - Min / max (value-index backed)
 
     /// The minimum value-column value for a group of a `min` index, or `nil` if the group is
-    /// empty. The index expression is `concat(groupColumns..., valueColumn)`; entries are kept
-    /// sorted, so the minimum is the first entry in the group's range.
+    /// empty — one key read (the first entry of the group's range).
     public func minimum<M: SwiftProtobuf.Message>(
         _ type: M.Type, indexNamed name: String, group: Tuple = Tuple()
     ) async throws -> (any TupleElement)? {
@@ -72,73 +112,69 @@ extension FDBRecordStore {
     private func extremum<M: SwiftProtobuf.Message>(
         _ type: M.Type, indexNamed name: String, group: Tuple, wantMaximum: Bool
     ) async throws -> (any TupleElement)? {
-        let index = try erasedIndex(type, named: name)
-        let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
-        // The value column is the last column of the expression; the rest are grouping.
-        let valueColumnIndex = max(index.columnIdentities.count - 1, 0)
-        let groupPrefix = indexSubspace.prefix + group.encode()
-
-        var first: (any TupleElement)?
-        var last: (any TupleElement)?
-        for try await (key, _) in transaction.getRange(beginKey: groupPrefix, endKey: groupPrefix + [0xFF]) {
-            let elements = try Tuple.decode(from: Array(key.dropFirst(indexSubspace.prefix.count)))
-            guard elements.count > valueColumnIndex else { continue }
-            let value = elements[valueColumnIndex]
-            if first == nil { first = value }
-            last = value
-        }
-        return wantMaximum ? last : first
+        let index = try scannableIndex(type, named: name)
+        let space = indexSubspace(index)
+        let groupPrefix = space.prefix + group.encode()
+        let result = try await transaction.getRangeNative(
+            beginSelector: .firstGreaterOrEqual(groupPrefix), endSelector: .firstGreaterOrEqual(groupPrefix + [0xFF]),
+            limit: 1, snapshot: false, reverse: wantMaximum)
+        guard let (key, _) = result.records.first else { return nil }
+        let elements = try space.unpack(key)
+        return elements.count > group.count ? elements[group.count] : nil
     }
 
     // MARK: - Rank indexes
 
-    /// The rank (0-based count of records ordered before `value`) for a `rank` index's field.
-    ///
-    /// This counts index entries whose leading column is strictly less than `value`.
+    /// The rank (0-based count of entries ordered before `value`) within a group of a `rank`
+    /// index, answered from the group's ranked set in O(log n) reads.
     public func rank<M: SwiftProtobuf.Message, V: IndexableValue>(
-        _ type: M.Type, indexNamed name: String, lessThan value: V
+        _ type: M.Type, indexNamed name: String, lessThan value: V, group: Tuple = Tuple()
     ) async throws -> Int {
-        let index = try erasedIndex(type, named: name)
-        let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
-        let begin = indexSubspace.range.begin
-        let end = indexSubspace.prefix + Tuple(value.asTupleElement()).encode()
-        var count = 0
-        for try await _ in transaction.getRange(beginKey: begin, endKey: end) {
-            count += 1
-        }
-        return count
+        let index = try scannableIndex(type, named: name)
+        let rankedSet = RankedSet(subspace: indexSecondarySubspace(index).subspace(group),
+                                  config: indexMaintainer(for: index).rankConfig)
+        if try await rankedSet.initNeeded(transaction, snapshot: true) { return 0 }
+        let score = Tuple(value.asTupleElement()).encode()
+        return Int(try await rankedSet.rank(transaction, key: score, nullIfMissing: false) ?? 0)
+    }
+
+    /// The score at `rank` within a group of a `rank` index, or `nil` if out of range.
+    public func scoreAt<M: SwiftProtobuf.Message>(
+        _ type: M.Type, indexNamed name: String, rank: Int, group: Tuple = Tuple()
+    ) async throws -> Tuple? {
+        let index = try scannableIndex(type, named: name)
+        let rankedSet = RankedSet(subspace: indexSecondarySubspace(index).subspace(group),
+                                  config: indexMaintainer(for: index).rankConfig)
+        if try await rankedSet.initNeeded(transaction, snapshot: true) { return nil }
+        guard let bytes = try await rankedSet.getNth(transaction, rank: Int64(rank)) else { return nil }
+        return Tuple(try Tuple.decode(from: bytes))
     }
 
     // MARK: - Version indexes
 
-    /// Scans records in commit-version order via a `version` index.
+    /// Scans records in version order via a `version` index whose expression is `version()`
+    /// (optionally after grouping columns, fixed by `group`).
     public func scanByVersion<M: SwiftProtobuf.Message & Sendable>(
-        _ type: M.Type, indexNamed name: String
+        _ type: M.Type, indexNamed name: String, group: Tuple = Tuple()
     ) throws -> RecordCursor<M> {
         guard let recordType = metaData.recordType(for: M.self) else {
             throw RecordStoreError.unknownRecordType(M.protoMessageName)
         }
-        let index = try erasedIndex(type, named: name)
-        let entriesSubspace = indexesSubspace.child(Int64(index.subspaceKey)).child(Int64(0))
-        let (begin, end) = entriesSubspace.range
-        // Each entry key is: entriesPrefix + <12-byte version> + <encoded primary key>.
-        let primaryKeyOffset = entriesSubspace.prefix.count
-            + FDBRecordVersion.globalVersionLength + FDBRecordVersion.localVersionLength
-        let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
+        let index = try scannableIndex(type, named: name)
+        let space = indexSubspace(index)
+        let (begin, end) = space.range(group)
+        let primaryKeyCount = recordType.primaryKeyColumnCount
         let tx = transaction
-        let recordName = recordType.recordName
-
         return RecordCursor {
             var iterator = tx.getRange(beginKey: begin, endKey: end).makeAsyncIterator()
             return {
                 while let (key, _) = try await iterator.next() {
-                    guard key.count > primaryKeyOffset else { continue }
-                    let primaryKeyEncoded = Array(key.dropFirst(primaryKeyOffset))
-                    let recordKey = typeSubspace.prefix + primaryKeyEncoded
-                    guard let bytes = try await tx.getValue(for: recordKey) else { continue }
-                    let message = try M(serializedBytes: bytes)
-                    let primaryKey = Tuple(try Tuple.decode(from: primaryKeyEncoded))
-                    return FDBStoredRecord(recordType: recordName, primaryKey: primaryKey, record: message)
+                    let elements = try space.unpack(key)
+                    guard elements.count >= primaryKeyCount else { continue }
+                    let primaryKey = Tuple(Array(elements.suffix(primaryKeyCount)))
+                    if let record: FDBStoredRecord<M> = try await self.loadTyped(primaryKey, recordType: recordType, filter: nil) {
+                        return record
+                    }
                 }
                 return nil
             }

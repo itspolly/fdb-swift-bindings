@@ -34,3 +34,16 @@ message Item {
   int64 quantity = 3;
   string category = 4;
 }
+
+// Time-window leaderboard tests (Java's NestedLeaderboardRecord / NestedLeaderboardEntry).
+message LeaderboardEntry {
+  int64 score = 1;
+  int64 timestamp = 2;
+  int64 context = 3;
+}
+
+message LeaderboardRecord {
+  string name = 1;
+  string game_id = 2;
+  repeated LeaderboardEntry scores = 3;
+}

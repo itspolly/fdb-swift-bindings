@@ -20,6 +20,7 @@
 
 #if RecordLayer
 import FoundationDB
+import SwiftProtobuf
 
 /// How a repeated (`repeated`) field contributes to a key.
 public enum FanType: Sendable, Hashable {
@@ -121,14 +122,20 @@ public struct KeyExpression<M>: Sendable {
     /// The number of columns each produced key contains.
     public var columnCount: Int { columnIdentities.count }
 
+    /// The expression's structure (Java's `KeyExpression` tree), or ``KeyExpressionNode/opaque``
+    /// for expressions built from closures that can't be described.
+    public let node: KeyExpressionNode
+
     init(
         evaluate: @escaping @Sendable (M) -> [[any TupleElement]],
         columnIdentities: [FieldID?],
-        producesMultipleKeys: Bool
+        producesMultipleKeys: Bool,
+        node: KeyExpressionNode = .opaque
     ) {
         self.evaluate = evaluate
         self.columnIdentities = columnIdentities
         self.producesMultipleKeys = producesMultipleKeys
+        self.node = node
     }
 }
 
@@ -140,7 +147,8 @@ extension KeyExpression {
         KeyExpression(
             evaluate: { record in [[record[keyPath: keyPath].asTupleElement()]] },
             columnIdentities: [.keyPath(keyPath)],
-            producesMultipleKeys: false
+            producesMultipleKeys: false,
+            node: fieldNode(keyPath, fanType: nil)
         )
     }
 
@@ -152,7 +160,8 @@ extension KeyExpression {
                 return [[value?.asTupleElement() ?? NullValue()]]
             },
             columnIdentities: [.keyPath(keyPath)],
-            producesMultipleKeys: false
+            producesMultipleKeys: false,
+            node: fieldNode(keyPath, fanType: nil)
         )
     }
 
@@ -172,7 +181,8 @@ extension KeyExpression {
                     record[keyPath: keyPath].map { [$0.asTupleElement()] }
                 },
                 columnIdentities: [.keyPath(keyPath)],
-                producesMultipleKeys: true
+                producesMultipleKeys: true,
+                node: fieldNode(keyPath, fanType: .fanOut)
             )
         case .concatenate:
             return KeyExpression(
@@ -181,7 +191,8 @@ extension KeyExpression {
                     return [[nested]]
                 },
                 columnIdentities: [nil],
-                producesMultipleKeys: false
+                producesMultipleKeys: false,
+                node: fieldNode(keyPath, fanType: .concatenate)
             )
         }
     }
@@ -197,7 +208,8 @@ extension KeyExpression {
                 crossProduct(expressions.map { $0.evaluate(record) })
             },
             columnIdentities: expressions.flatMap { $0.columnIdentities },
-            producesMultipleKeys: expressions.contains { $0.producesMultipleKeys }
+            producesMultipleKeys: expressions.contains { $0.producesMultipleKeys },
+            node: expressions.contains { $0.node == .opaque } ? .opaque : .then(expressions.map(\.node))
         )
     }
 
@@ -206,15 +218,103 @@ extension KeyExpression {
         concat(expressions)
     }
 
-    /// A placeholder expression for a version index: it contributes no columns of its own
-    /// (records are ordered by the commit versionstamp the store assigns).
+    /// The record's version — Java's `version()` key expression.
+    ///
+    /// Produces a single column holding the record's ``FDBRecordVersion`` as a tuple
+    /// `Versionstamp` (12 bytes: commit versionstamp + local version). For a record saved in the
+    /// current transaction the version is still incomplete; the store writes such entries with a
+    /// versionstamped-key mutation at commit, exactly as the Java layer does.
     public static func version() -> KeyExpression<M> {
         KeyExpression(
-            evaluate: { _ in [[]] },
-            columnIdentities: [],
-            producesMultipleKeys: false
+            evaluate: { _ in [[RecordVersionPlaceholder()]] },
+            columnIdentities: [nil],
+            producesMultipleKeys: false,
+            node: .version
         )
     }
+
+    /// The record's type key — Java's `recordType()` key expression.
+    ///
+    /// Leading a primary key with it (`.concat(.recordType(), .field(\.id))`) clusters each
+    /// type's records under their own key prefix, so scans of one type touch only that type's
+    /// records and primary keys of different types can't collide.
+    public static func recordType() -> KeyExpression<M> {
+        KeyExpression(
+            evaluate: { _ in [[RecordTypeKeyPlaceholder()]] },
+            columnIdentities: [nil],
+            producesMultipleKeys: false,
+            node: .recordType
+        )
+    }
+
+    /// An expression with no columns (Java's `empty()`), e.g. the group of an ungrouped count.
+    public static func empty() -> KeyExpression<M> {
+        KeyExpression(evaluate: { _ in [[]] }, columnIdentities: [], producesMultipleKeys: false, node: .empty)
+    }
+
+    /// An expression evaluated by field number from its structure, e.g. one loaded from Java
+    /// metadata or shared by several record types.
+    public static func structured(_ node: KeyExpressionNode) -> KeyExpression<M> {
+        node.keyExpression()
+    }
+}
+
+/// The node for a field reached by `keyPath`, resolved to its protobuf field-number path by
+/// stamping a probe message (``FieldNumberResolver``); `.opaque` if it can't be resolved.
+private func fieldNode<M, V: IndexableValue>(_ keyPath: KeyPath<M, V>, fanType: FanType?) -> KeyExpressionNode {
+    guard let writable = keyPath as? WritableKeyPath<M, V>,
+          let path = resolvePath(writable) else { return .opaque }
+    return .path(path, fanType: fanType)
+}
+
+private func fieldNode<M, V: IndexableValue>(_ keyPath: KeyPath<M, V?>, fanType: FanType?) -> KeyExpressionNode {
+    guard let writable = keyPath as? WritableKeyPath<M, V?>,
+          let path = resolveOptionalPath(writable) else { return .opaque }
+    return .path(path, fanType: fanType)
+}
+
+private func fieldNode<M, V: IndexableValue>(_ keyPath: KeyPath<M, [V]>, fanType: FanType?) -> KeyExpressionNode {
+    guard let writable = keyPath as? WritableKeyPath<M, [V]>,
+          let path = resolveRepeatedPath(writable) else { return .opaque }
+    return .path(path, fanType: fanType)
+}
+
+private func resolvePath<M, V: IndexableValue>(_ keyPath: WritableKeyPath<M, V>) -> [Int]? {
+    func open<T: SwiftProtobuf.Message>(_: T.Type) -> [Int]? {
+        FieldNumberResolver.resolve(keyPath as! WritableKeyPath<T, V>)
+    }
+    guard let type = M.self as? any SwiftProtobuf.Message.Type else { return nil }
+    return open(type)
+}
+
+private func resolveOptionalPath<M, V: IndexableValue>(_ keyPath: WritableKeyPath<M, V?>) -> [Int]? {
+    func open<T: SwiftProtobuf.Message>(_: T.Type) -> [Int]? {
+        FieldNumberResolver.resolve(keyPath as! WritableKeyPath<T, V?>)
+    }
+    guard let type = M.self as? any SwiftProtobuf.Message.Type else { return nil }
+    return open(type)
+}
+
+private func resolveRepeatedPath<M, V: IndexableValue>(_ keyPath: WritableKeyPath<M, [V]>) -> [Int]? {
+    func open<T: SwiftProtobuf.Message>(_: T.Type) -> [Int]? {
+        FieldNumberResolver.resolve(keyPath as! WritableKeyPath<T, [V]>)
+    }
+    guard let type = M.self as? any SwiftProtobuf.Message.Type else { return nil }
+    return open(type)
+}
+
+/// Stand-in column produced by ``KeyExpression/version()``; the store replaces it with the
+/// record's version before writing. Never persisted.
+struct RecordVersionPlaceholder: TupleElement {
+    func encodeTuple() -> FDB.Bytes { preconditionFailure("record version placeholder must be resolved before encoding") }
+    static func decodeTuple(from _: FDB.Bytes, at _: inout Int) throws -> RecordVersionPlaceholder { RecordVersionPlaceholder() }
+}
+
+/// Stand-in column produced by ``KeyExpression/recordType()``; replaced with the record type's
+/// key when the expression is evaluated for a concrete record type. Never persisted.
+struct RecordTypeKeyPlaceholder: TupleElement {
+    func encodeTuple() -> FDB.Bytes { preconditionFailure("record type key placeholder must be resolved before encoding") }
+    static func decodeTuple(from _: FDB.Bytes, at _: inout Int) throws -> RecordTypeKeyPlaceholder { RecordTypeKeyPlaceholder() }
 }
 
 /// Cartesian product of per-group keys, concatenating columns.

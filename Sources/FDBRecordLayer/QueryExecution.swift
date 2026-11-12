@@ -60,10 +60,9 @@ extension FDBRecordStore {
         case .fullScan:
             base = Self.filtered(try scan(M.self), by: filter)
         case .primaryKeyScan(let equalityBounds, let trailing):
-            let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
             let (begin, end) = Self.scanRange(
-                prefix: typeSubspace.prefix, equalityBounds: equalityBounds, trailing: trailing)
-            base = recordRangeCursor(begin: begin, end: end, recordType: recordType, filter: filter)
+                prefix: [], equalityBounds: recordType.recordTypePrefix + equalityBounds, trailing: trailing)
+            base = typedCursor(scanRecords(begin: begin, end: end), recordType: recordType, filter: filter)
         case .indexScan(let scan):
             let primaryKeys = try await collectPrimaryKeys([scan], recordType: recordType, distinct: needsDistinct)
             base = recordCursor(primaryKeys: primaryKeys, recordType: recordType, filter: filter)
@@ -93,9 +92,8 @@ extension FDBRecordStore {
 
         // No filter: count record keys directly, no deserialization.
         guard let node = query.filter?.node else {
-            let (begin, end) = recordsSubspace.child(Int64(recordType.typeKey)).range
             var total = 0
-            for try await _ in transaction.getRange(beginKey: begin, endKey: end) { total += 1 }
+            for try await _ in try scan(M.self) { total += 1 }
             return total
         }
 
@@ -124,7 +122,7 @@ extension FDBRecordStore {
         }
         let index = try erasedIndex(M.self, named: indexName)
         let node = query.filter?.node ?? .and([])
-        guard indexState(named: indexName) == .readable,
+        guard indexState(named: indexName).isScannable,
               index.type == .value || index.type == .rank,
               let scan = QueryPlanner.scan(index: index, atoms: node.conjunctionAtoms),
               QueryPlanner.isFullyCovered(node, by: scan)
@@ -132,11 +130,11 @@ extension FDBRecordStore {
             throw RecordStoreError.queryNotCovered(indexName)
         }
 
-        let indexSubspace = indexesSubspace.child(Int64(index.subspaceKey))
+        let indexSubspace = self.indexSubspace(index)
         let (begin, end) = Self.indexRange(indexSubspace, scan)
         let prefixLength = indexSubspace.prefix.count
         let columnCount = index.columnIdentities.count
-        let primaryKeyCount = recordType.primaryKeyIdentities.count
+        let primaryKeyCount = recordType.primaryKeyColumnCount
 
         var result: [CoveredRecord] = []
         for try await (key, _) in transaction.getRange(beginKey: begin, endKey: end) {
@@ -177,24 +175,21 @@ extension FDBRecordStore {
         case .union:
             return try await offsetPage(query, limit: limit, continuation: continuation)
         case .fullScan:
-            let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
-            return try await keyBasedPage(
-                range: typeSubspace.range, prefixLength: typeSubspace.prefix.count,
-                isIndexScan: false, recordType: recordType, filter: query.filter,
+            let range = recordTypeRange(recordType)
+            return try await recordPage(
+                begin: range.begin, end: range.end, recordType: recordType, filter: query.filter,
                 limit: limit, continuation: continuation)
         case .primaryKeyScan(let equalityBounds, let trailing):
-            let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
-            let range = Self.scanRange(
-                prefix: typeSubspace.prefix, equalityBounds: equalityBounds, trailing: trailing)
-            return try await keyBasedPage(
-                range: range, prefixLength: typeSubspace.prefix.count,
-                isIndexScan: false, recordType: recordType, filter: query.filter,
+            let (begin, end) = Self.scanRange(
+                prefix: [], equalityBounds: recordType.recordTypePrefix + equalityBounds, trailing: trailing)
+            return try await recordPage(
+                begin: begin, end: end, recordType: recordType, filter: query.filter,
                 limit: limit, continuation: continuation)
         case .indexScan(let scan):
-            let indexSubspace = indexesSubspace.child(Int64(scan.index.subspaceKey))
-            return try await keyBasedPage(
+            let indexSubspace = self.indexSubspace(scan.index)
+            return try await indexPage(
                 range: Self.indexRange(indexSubspace, scan), prefixLength: indexSubspace.prefix.count,
-                isIndexScan: true, recordType: recordType, filter: query.filter,
+                recordType: recordType, filter: query.filter,
                 limit: limit, continuation: continuation)
         }
     }
@@ -211,44 +206,60 @@ extension FDBRecordStore {
         return QueryPage(records: Array(all[offset..<endIndex]), continuation: next)
     }
 
-    /// Key-based paging for a streaming plan: resume the KV scan after the continuation key,
-    /// collect up to `limit` post-filter records, and emit the last key as the continuation.
-    private func keyBasedPage<M: SwiftProtobuf.Message & Sendable>(
-        range: (begin: FDB.Bytes, end: FDB.Bytes), prefixLength: Int, isIndexScan: Bool,
+    /// Key-based paging over the records subspace: resume after the continuation's primary
+    /// key, collect up to `limit` post-filter records, and emit the last primary key.
+    private func recordPage<M: SwiftProtobuf.Message & Sendable>(
+        begin: FDB.Bytes?, end: FDB.Bytes?, recordType: ErasedRecordType, filter: QueryComponent<M>?,
+        limit: Int, continuation: FDB.Bytes?
+    ) async throws -> QueryPage<M> {
+        // A record's keys are <pk>/<suffix>; everything for the last pk sorts before <pk>+0xFF.
+        let resume = Self.decodeKey(continuation).map { $0 + [0xFF] } ?? begin
+        var records: [FDBStoredRecord<M>] = []
+        var iterator = typedCursor(scanRecords(begin: resume, end: end), recordType: recordType, filter: filter)
+            .makeAsyncIterator()
+        while records.count < limit, let record = try await iterator.next() {
+            records.append(record)
+        }
+        let next = records.count == limit ? records.last.map { Self.encodeKey($0.primaryKey.encode()) } : nil
+        return QueryPage(records: records, continuation: next)
+    }
+
+    /// Key-based paging for an index scan: resume the KV scan after the continuation key,
+    /// collect up to `limit` post-filter records, and emit the last index key.
+    private func indexPage<M: SwiftProtobuf.Message & Sendable>(
+        range: (begin: FDB.Bytes, end: FDB.Bytes), prefixLength: Int,
         recordType: ErasedRecordType, filter: QueryComponent<M>?, limit: Int, continuation: FDB.Bytes?
     ) async throws -> QueryPage<M> {
         let begin = Self.decodeKey(continuation).map { $0 + [0x00] } ?? range.begin
-        let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
-        let primaryKeyCount = recordType.primaryKeyIdentities.count
-        let name = recordType.recordName
+        let primaryKeyCount = recordType.primaryKeyColumnCount
 
         var records: [FDBStoredRecord<M>] = []
         var lastScanKey: FDB.Bytes?
         var iterator = transaction.getRange(beginKey: begin, endKey: range.end).makeAsyncIterator()
-        while records.count < limit, let (key, value) = try await iterator.next() {
-            let record: FDBStoredRecord<M>?
-            if isIndexScan {
-                let elements = try Tuple.decode(from: Array(key.dropFirst(prefixLength)))
-                guard elements.count >= primaryKeyCount else { continue }
-                let primaryKey = Tuple(Array(elements.suffix(primaryKeyCount)))
-                guard let bytes = try await transaction.getValue(
-                    for: typeSubspace.prefix + primaryKey.encode()) else { continue }
-                let message = try M(serializedBytes: bytes)
-                record = (filter?.eval(message) ?? true)
-                    ? FDBStoredRecord(recordType: name, primaryKey: primaryKey, record: message) : nil
-            } else {
-                let primaryKey = Tuple(try Tuple.decode(from: Array(key.dropFirst(prefixLength))))
-                let message = try M(serializedBytes: value)
-                record = (filter?.eval(message) ?? true)
-                    ? FDBStoredRecord(recordType: name, primaryKey: primaryKey, record: message) : nil
-            }
-            if let record {
-                records.append(record)
-                lastScanKey = key
-            }
+        while records.count < limit, let (key, _) = try await iterator.next() {
+            let elements = try Tuple.decode(from: Array(key.dropFirst(prefixLength)))
+            guard elements.count >= primaryKeyCount else { continue }
+            let primaryKey = Tuple(Array(elements.suffix(primaryKeyCount)))
+            guard let record: FDBStoredRecord<M> = try await loadTyped(primaryKey, recordType: recordType, filter: filter)
+            else { continue }
+            records.append(record)
+            lastScanKey = key
         }
         let next = records.count == limit ? lastScanKey.map(Self.encodeKey) : nil
         return QueryPage(records: records, continuation: next)
+    }
+
+    /// Loads a record by primary key if it is of `recordType` and passes `filter`.
+    func loadTyped<M: SwiftProtobuf.Message & Sendable>(
+        _ primaryKey: Tuple, recordType: ErasedRecordType, filter: QueryComponent<M>?
+    ) async throws -> FDBStoredRecord<M>? {
+        guard let existing = try await loadExisting(primaryKey),
+              existing.indexable.recordType.recordName == recordType.recordName,
+              let message = existing.indexable.message as? M else { return nil }
+        if let filter, !filter.eval(message) { return nil }
+        return FDBStoredRecord(
+            recordType: recordType.recordName, primaryKey: primaryKey, record: message,
+            version: existing.indexable.version)
     }
 
     // Continuation token codec: tag byte 0x01 = scan key, 0x02 = offset.
@@ -271,11 +282,11 @@ extension FDBRecordStore {
     private func collectPrimaryKeys(
         _ scans: [IndexScan], recordType: ErasedRecordType, distinct: Bool
     ) async throws -> [Tuple] {
-        let primaryKeyCount = recordType.primaryKeyIdentities.count
+        let primaryKeyCount = recordType.primaryKeyColumnCount
         var seen = Set<FDB.Bytes>()
         var primaryKeys: [Tuple] = []
         for scan in scans {
-            let indexSubspace = indexesSubspace.child(Int64(scan.index.subspaceKey))
+            let indexSubspace = self.indexSubspace(scan.index)
             let (begin, end) = Self.indexRange(indexSubspace, scan)
             let prefixLength = indexSubspace.prefix.count
             for try await (key, _) in transaction.getRange(beginKey: begin, endKey: end) {
@@ -296,42 +307,15 @@ extension FDBRecordStore {
     private func recordCursor<M: SwiftProtobuf.Message & Sendable>(
         primaryKeys: [Tuple], recordType: ErasedRecordType, filter: QueryComponent<M>?
     ) -> RecordCursor<M> {
-        let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
-        let tx = transaction
-        let name = recordType.recordName
-        return RecordCursor {
+        RecordCursor {
             var index = 0
             return {
                 while index < primaryKeys.count {
                     let primaryKey = primaryKeys[index]
                     index += 1
-                    let recordKey = typeSubspace.prefix + primaryKey.encode()
-                    guard let bytes = try await tx.getValue(for: recordKey) else { continue }
-                    let message = try M(serializedBytes: bytes)
-                    if let filter, !filter.eval(message) { continue }
-                    return FDBStoredRecord(recordType: name, primaryKey: primaryKey, record: message)
-                }
-                return nil
-            }
-        }
-    }
-
-    /// A cursor over the clustered records in `[begin, end)` (a primary-key range), applying the
-    /// residual filter. The record bytes are read directly — no secondary-index indirection.
-    private func recordRangeCursor<M: SwiftProtobuf.Message & Sendable>(
-        begin: FDB.Bytes, end: FDB.Bytes, recordType: ErasedRecordType, filter: QueryComponent<M>?
-    ) -> RecordCursor<M> {
-        let typeSubspace = recordsSubspace.child(Int64(recordType.typeKey))
-        let tx = transaction
-        let name = recordType.recordName
-        return RecordCursor {
-            var iterator = tx.getRange(beginKey: begin, endKey: end).makeAsyncIterator()
-            return {
-                while let (key, value) = try await iterator.next() {
-                    let primaryKey = Tuple(try typeSubspace.unpack(key))
-                    let message = try M(serializedBytes: value)
-                    if let filter, !filter.eval(message) { continue }
-                    return FDBStoredRecord(recordType: name, primaryKey: primaryKey, record: message)
+                    if let record: FDBStoredRecord<M> = try await self.loadTyped(primaryKey, recordType: recordType, filter: filter) {
+                        return record
+                    }
                 }
                 return nil
             }

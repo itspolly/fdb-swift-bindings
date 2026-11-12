@@ -46,7 +46,7 @@ struct AdvancedIndexTests {
             }
             #expect(flowers == 2)
             #expect(vases == 1)
-            #expect(total == 3)
+            #expect(total.total == 3 && total.complete)
 
             // Deleting decrements the group's count.
             try await run { try await $0.delete(Fdb_Test_Item.self, primaryKey: Tuple("a")) }

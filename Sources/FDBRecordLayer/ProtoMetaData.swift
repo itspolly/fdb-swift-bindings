@@ -46,10 +46,9 @@ extension RecordMetaData {
     ///   - descriptorSetData: the serialized `FileDescriptorSet` bytes.
     ///   - recordTypes: the generated message types to register (matched by message name).
     ///
-    /// - Note: record types and indexes built this way currently take **positional** storage
-    ///   keys (by the order of `recordTypes` and of fields in the descriptor), so that order
-    ///   must stay stable for an existing store — append only, like the keyless Swift DSL.
-    ///   Use the Swift DSL with explicit `key:` values when you need order-independent evolution.
+    /// - Note: record types built this way take union field numbers in the order of
+    ///   `recordTypes` (from 1), so that order must stay stable for an existing store — append
+    ///   only. Indexes use their names as subspace keys, as in the Java layer.
     public init(
         version: Int = 1,
         descriptorSetData: Data,
@@ -157,7 +156,14 @@ extension IndexType {
     init(protoString: String) {
         switch protoString {
         case "count": self = .count
+        case "count_updates": self = .countUpdates
+        case "count_not_null": self = .countNotNull
         case "sum": self = .sum
+        case "min_ever_tuple", "min_ever": self = .minEverTuple
+        case "max_ever_tuple", "max_ever": self = .maxEverTuple
+        case "min_ever_long": self = .minEverLong
+        case "max_ever_long": self = .maxEverLong
+        case "max_ever_version": self = .maxEverVersion
         case "rank": self = .rank
         case "version": self = .version
         case "min": self = .min
@@ -179,24 +185,30 @@ private func makeErasedRecordType(
         let indexInfos = info.indexes
         return ErasedRecordType(
             recordName: M.protoMessageName,
-            typeKey: -1,
             explicitKey: nil,
+            explicitUnionField: nil,
+            sinceVersion: nil,
             storesVersions: false,
-            primaryKeyColumns: { message in
+            primaryKeyStartsWithRecordType: false,
+            rawPrimaryKey: { message in
                 primaryKeyFields.map { extractFieldValues(message, fieldNumber: $0).first ?? NullValue() }
             },
-            primaryKeyIdentities: primaryKeyFields.map { FieldID.fieldNumber($0) },
+            primaryKeyColumnIdentities: primaryKeyFields.map { FieldID.fieldNumber($0) },
             deserialize: { bytes in try M(serializedBytes: bytes) },
             indexes: indexInfos.map { info in
                 ErasedIndex(
                     name: info.name,
                     type: info.type,
-                    subspaceKey: -1,
+                    subspaceKey: info.name,
                     explicitKey: nil,
                     unique: info.unique,
                     producesMultipleKeys: info.repeated,
                     columnIdentities: [.fieldPath(info.path)],
-                    entries: { message in
+                    addedVersion: 0,
+                    lastModifiedVersion: 0,
+                    groupedCount: info.type.defaultGroupedCount,
+                    clearWhenZero: false,
+                    rawEntries: { message in
                         let values = extractFieldValues(message, fieldPath: info.path)
                         if info.repeated { return values.map { [$0] } }
                         return [[values.first ?? NullValue()]]

@@ -21,14 +21,20 @@ import CFoundationDB
 
 // TODO: These should be auto-generated like other bindings
 enum FDBErrorCode: Int32, CaseIterable {
-    case notCommitted = 1007
-    case transactionTooOld = 1020
-    case futureVersion = 1021
+    case timedOut = 1004
+    case transactionTooOld = 1007
+    case futureVersion = 1009
+    case notCommitted = 1020
+    case commitUnknownResult = 1021
     case transactionCancelled = 1025
     case transactionTimedOut = 1031
     case processBehind = 1037
+    case commitReadIncomplete = 1039
     case tagThrottled = 1213
     case internalError = 2000
+    case transactionTooLarge = 2101
+    case keyTooLarge = 2102
+    case valueTooLarge = 2103
     case networkError = 2201
     case clientError = 4100
     case unknownError = 9999
@@ -63,6 +69,10 @@ public struct FDBError: Error, CustomStringConvertible {
         case FDBErrorCode.transactionTooOld.rawValue:
             return true
         case FDBErrorCode.futureVersion.rawValue:
+            return true
+        case FDBErrorCode.commitUnknownResult.rawValue:
+            // Retried by fdb_transaction_on_error too; callers needing exactly-once effects must
+            // make their transactions idempotent.
             return true
         case FDBErrorCode.transactionCancelled.rawValue:
             return false

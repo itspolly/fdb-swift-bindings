@@ -74,7 +74,8 @@ public protocol TupleElement: Sendable, Hashable, Equatable {
 /// These semantic differences ensure consistency with FoundationDB's tuple ordering and are
 /// important when using tuples as dictionary keys or in sets.
 public struct Tuple: Sendable, Hashable, Equatable {
-    private let elements: [any TupleElement]
+    /// The tuple's elements, in order.
+    public let elements: [any TupleElement]
 
     public init(_ elements: any TupleElement...) {
         self.elements = elements
@@ -508,21 +509,15 @@ extension Int64: TupleElement {
             let bytes = withUnsafeBytes(of: bigEndianValue) { Array($0) }
             encoded.append(contentsOf: bytes.suffix(n))
         } else {
-            let n = bisectLeft(UInt64(-value))
+            // `magnitude`, not `-value`: negating Int64.min traps.
+            let n = bisectLeft(value.magnitude)
             encoded.append(TupleTypeCode.intZero.rawValue - UInt8(n))
-
-            if n < 8 {
-                let offset = UInt64(sizeLimits[n]) &+ UInt64(bitPattern: value)
-                let bigEndianValue = offset.bigEndian
-                let bytes = withUnsafeBytes(of: bigEndianValue) { Array($0) }
-                encoded.append(contentsOf: bytes.suffix(n))
-            } else {
-                // n == 8 case
-                let offset = UInt64(bitPattern: value)
-                let bigEndianValue = offset.bigEndian
-                let bytes = withUnsafeBytes(of: bigEndianValue) { Array($0) }
-                encoded.append(contentsOf: bytes)
-            }
+            // Negative integers are stored as (2^(8n) - 1) + value, per the tuple spec (and the
+            // Java/Python bindings); for n == 8 that is the bit pattern minus one.
+            let offset = UInt64(sizeLimits[n]) &+ UInt64(bitPattern: value)
+            let bigEndianValue = offset.bigEndian
+            let bytes = withUnsafeBytes(of: bigEndianValue) { Array($0) }
+            encoded.append(contentsOf: bytes.suffix(n))
         }
 
         return encoded
@@ -555,11 +550,8 @@ extension Int64: TupleElement {
         }
 
         if neg {
-            if n == 8 {
-                return ret
-            } else {
-                return ret - Int64(sizeLimits[n])
-            }
+            // Inverse of the encoding: value = stored - (2^(8n) - 1), computed modulo 2^64.
+            return Int64(bitPattern: UInt64(bitPattern: ret) &- sizeLimits[n])
         }
 
         if ret > 0 {

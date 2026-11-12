@@ -327,32 +327,92 @@ let n = try await store.count(RecordQuery(Order.self).where(Query.field(\.price)
 
 ### Adding an index to a populated store
 
-A new index on a store that already has records opens in the `writeOnly` state — maintained on
-writes but hidden from queries — until it is backfilled. Build it online (in batches, across
-transactions, resumable) to make it `readable`:
+The store layout and index lifecycle follow the Java Record Layer. Schema changes are driven by
+**metadata versions**: give a new (or changed) index an `addedVersion` and bump the metadata
+`version` to at least that value. An index whose version is not newer than the version recorded
+in a store is assumed to be already built there, so always bump the version when adding one.
+
+```swift
+let meta = RecordMetaData(version: 2) {
+    RecordType(Order.self, primaryKey: \.orderId)
+        .index("priceIdx", on: \.price, addedVersion: 2)
+}
+```
+
+On open, a new index on an empty store (or on record types that are themselves new) becomes
+`readable` immediately; on a populated store it becomes `disabled`, and is built online — in
+batches, across transactions, resumably — by an `OnlineIndexer`:
 
 ```swift
 try await database.buildIndex(subspace: subspace, metaData: meta, indexName: "priceIdx")
 ```
 
+While the index is being built (`writeOnly`), saves keep it up to date; count/sum-style indexes
+are only updated for records the build has already passed, so no record is counted twice. Batch
+size adapts to transaction-size and timeout errors (`OnlineIndexer.Config`). A client opening the
+store with an older metadata version is refused (`RecordStoreError.staleMetaData`).
+
 ### Stable keys and schema evolution
 
-Record types and indexes occupy storage by an integer key. Give them **explicit, stable keys**
-so the on-disk layout is independent of declaration order — then you can reorder declarations,
-and add or remove entries, freely (treat keys like protobuf field numbers: never reuse a retired
-one). Without explicit keys, keys are positional, so a keyless schema must only ever be
-*appended* to.
+Records are stored wrapped in a union message whose field number identifies the record type
+(Java's `RecordTypeUnion`); indexes live under their name. Union field numbers default to
+declaration order starting at 1, so either keep declarations append-only or pin them: a positive
+`key:` on a record type pins both its record type key and its union field (or use `unionField:`).
+Index `key:`s replace the index name as the storage key.
 
 ```swift
 RecordMetaData {
     RecordType(Order.self, key: 1, primaryKey: \.orderId)
-        .index("price", on: \.price, key: 10)
+        .index("price", on: \.price)
     RecordType(Customer.self, key: 2, primaryKey: \.id)
 }
 ```
 
-To retire an index: `try await store.clearIndex(named: "price")` (wipes its data), then drop it
-from the schema and never reuse its key. Clearing one index never affects another.
+To retire an index, drop it from the schema, bump the version, and list it as a former index so
+stores clear its data on upgrade:
+
+```swift
+RecordMetaData(version: 3, formerIndexes: [FormerIndex(name: "price", removedVersion: 3)]) { ... }
+```
+
+### Multi-type indexes, synthetic record types and record counts
+
+An index can span several record types (or all of them) when its expression is structural —
+written against protobuf field numbers with `KeyExpressionNode`:
+
+```swift
+RecordMetaData(multiTypeIndexes: [
+    MultiTypeIndex("byName", on: .field(number: 2, fanType: nil), recordTypes: [Order.self, Item.self])
+]) { ... }
+```
+
+Joined and unnested record types (Java's synthetic types) are never stored; their indexes are
+kept up to date whenever a constituent record is saved or deleted:
+
+```swift
+let orderItems = JoinedRecordType(
+    "OrderItem",
+    constituents: [.init("order", Order.self), .init("item", Item.self)],
+    joins: [.init("order", .field(number: 2, fanType: nil), "item", .field(number: 4, fanType: nil))],
+    indexes: [SyntheticIndex("orderItem.price", on: .nest(number: 1, fanType: nil, child: .field(number: 3, fanType: nil)))])
+let meta = RecordMetaData(joinedRecordTypes: [orderItems]) { ... }
+```
+
+`RecordMetaData(recordCountKey:)` keeps Java's per-key record counts
+(`store.snapshotRecordCount(key:)`). Indexes can be retired in favour of others with
+`options: ["replacedBy1": "newIndex"]`: once every replacement is readable the old index is
+disabled. Hot stores can cache their header and index states across transactions with
+`store.setStateCacheability(true)` plus a shared `RecordStoreStateCache` passed to `open`.
+
+### Stores written by earlier versions of this package
+
+Stores written before the Java-compatible layout must be migrated once; opening one fails with
+`RecordStoreError.legacyStoreNeedsMigration` until then. Migration fences out old clients, locks
+the store, converts records in batches, and rebuilds every index:
+
+```swift
+try await database.migrateLegacyRecordStore(subspace: subspace, metaData: meta)
+```
 
 ### Unique indexes
 
@@ -363,12 +423,13 @@ other indexes on the same type.
 
 ```swift
 RecordType(User.self, key: 1, primaryKey: \.id)
-    .index("email", on: \.email, key: 10, unique: true)
+    .index("email", on: \.email, unique: true)
 ```
 
 ### Record versions & optimistic concurrency
 
-Opt a record type into versioning with `.storingVersions()`. Each save stamps the record with
+Opt into versioning with `.storingVersions()` (as in Java this is store-wide: every record type
+then carries versions). Each save stamps the record with
 the transaction's commit versionstamp (an opaque, monotonic ETag), surfaced as
 `FDBStoredRecord.version` on load. `save(_:ifVersionMatches:)` writes only if the stored version
 still matches — otherwise it throws `RecordStoreError.versionMismatch`, which is **not** a
