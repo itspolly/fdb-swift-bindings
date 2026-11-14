@@ -59,6 +59,66 @@ struct JavaParityExtrasTests {
 
     private func fresh() -> Subspace { Subspace(Tuple("fdbrl-extras", UUID().uuidString)) }
 
+    @Test("type-prefixed primary keys: full keys as in Java, id: helpers add the type key")
+    func typePrefixedPrimaryKeys() async throws {
+        let db = try await database()
+        let subspace = fresh()
+        let meta = RecordMetaData {
+            RecordType(Fdb_Test_Order.self, primaryKey: .concat(.recordType(), .field(\.orderID)))
+            RecordType(Fdb_Test_Customer.self, primaryKey: .concat(.recordType(), .field(\.id)))
+            RecordType(Fdb_Test_Item.self, primaryKey: \.sku)
+        }
+        var customer = Fdb_Test_Customer()
+        customer.id = 42
+        customer.name = "ada"
+        try await run(db, subspace, meta) { store in
+            _ = try await store.save(Fdb_Test_Order.sample(id: 42, price: 7))
+            _ = try await store.save(customer)
+        }
+        struct Checks: Sendable {
+            var orderPrice: Int64?, customerName: String?, bareIdFound: Bool
+            var full: Tuple, expectedFull: Tuple, loadedFullKey: Tuple?
+            var deleteOtherTypeRefused: Bool, idOnPlainTypeRefused: Bool, deleted: Bool
+        }
+        let checks = try await run(db, subspace, meta) { store -> Checks in
+            let full = try store.primaryKey(for: Fdb_Test_Order.self, id: Tuple(Int64(42)))
+            let customerKey = try store.primaryKey(for: Fdb_Test_Customer.self, id: Tuple(Int64(42)))
+            var deleteOtherTypeRefused = false
+            do { _ = try await store.delete(Fdb_Test_Order.self, primaryKey: customerKey) }
+            catch RecordStoreError.recordTypeMismatch { deleteOtherTypeRefused = true }
+            var idOnPlainTypeRefused = false
+            do { _ = try await store.load(Fdb_Test_Item.self, id: "x") }
+            catch RecordStoreError.primaryKeyNotTypePrefixed { idOnPlainTypeRefused = true }
+            return Checks(
+                orderPrice: try await store.load(Fdb_Test_Order.self, id: Int64(42))?.record.price,
+                customerName: try await store.load(Fdb_Test_Customer.self, id: Int64(42))?.record.name,
+                bareIdFound: try await store.load(Fdb_Test_Order.self, primaryKey: Tuple(Int64(42))) != nil,
+                full: full,
+                expectedFull: Tuple(try store.recordTypeKey(for: Fdb_Test_Order.self), Int64(42)),
+                loadedFullKey: try await store.load(Fdb_Test_Order.self, primaryKey: full)?.primaryKey,
+                deleteOtherTypeRefused: deleteOtherTypeRefused,
+                idOnPlainTypeRefused: idOnPlainTypeRefused,
+                deleted: try await store.delete(Fdb_Test_Customer.self, id: Int64(42)))
+        }
+        // Same id, different types: no collision.
+        #expect(checks.orderPrice == 7)
+        #expect(checks.customerName == "ada")
+        // primaryKey: is the full key (Java's loadRecord): a bare id is not filled in.
+        #expect(!checks.bareIdFound)
+        #expect(checks.full == checks.expectedFull)
+        #expect(checks.loadedFullKey == checks.full)
+        // Typed delete never deletes another type's record; id: needs a recordType() prefix.
+        #expect(checks.deleteOtherTypeRefused)
+        #expect(checks.idOnPlainTypeRefused)
+        #expect(checks.deleted)
+        let after = try await run(db, subspace, meta) { store in
+            (try await store.load(Fdb_Test_Customer.self, id: Int64(42)) == nil,
+             try await store.load(Fdb_Test_Order.self, id: Int64(42)) != nil)
+        }
+        #expect(after.0 && after.1)
+        try await cleanup(db, subspace)
+    }
+
     @Test("record count key counts inserts and deletes per key")
     func recordCounts() async throws {
         let db = try await database()

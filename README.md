@@ -375,6 +375,21 @@ stores clear its data on upgrade:
 RecordMetaData(version: 3, formerIndexes: [FormerIndex(name: "price", removedVersion: 3)]) { ... }
 ```
 
+### Primary keys shared between record types
+
+All record types share one key space, as in the Java Record Layer, so two types with the same
+primary-key values collide. Prefix such types' primary keys with the record type, and use the
+`id:` helpers to load and delete by the rest of the key:
+
+```swift
+RecordType(Account.self, key: 1, primaryKey: .concat(.recordType(), .field(\.id)))
+
+let account = try await store.load(Account.self, id: accountID)   // loads (typeKey, accountID)
+try await store.delete(Account.self, id: accountID)
+```
+
+`load(_:primaryKey:)` / `delete(_:primaryKey:)` take the full key, exactly as Java's `loadRecord`.
+
 ### Multi-type indexes, synthetic record types and record counts
 
 An index can span several record types (or all of them) when its expression is structural —

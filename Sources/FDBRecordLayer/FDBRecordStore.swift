@@ -79,6 +79,9 @@ public enum RecordStoreError: Error, Sendable {
     /// bytes) size limits.
     case keyTooLarge(index: String?, size: Int)
     case valueTooLarge(index: String?, size: Int)
+    /// `load(_:id:)` / `delete(_:id:)` was used on a type whose primary key doesn't start with
+    /// `recordType()`; pass the full key with `primaryKey:` instead.
+    case primaryKeyNotTypePrefixed(String)
     /// A stored record was of a different type than the one requested.
     case recordTypeMismatch(expected: String, found: String)
     /// A `min_ever_long`/`max_ever_long` index was given a negative value.
@@ -822,9 +825,33 @@ public final class FDBRecordStore: Sendable {
         return try await save(record)
     }
 
-    /// Loads the record of type `M` with the given primary key, or `nil` if none exists.
-    /// Throws ``RecordStoreError/recordTypeMismatch(expected:found:)`` if the key holds a record
-    /// of another type.
+    /// The full primary key for the record of type `M` whose primary key, after its leading
+    /// ``KeyExpression/recordType()`` column, is `id`. Throws
+    /// ``RecordStoreError/primaryKeyNotTypePrefixed(_:)`` if `M`'s primary key doesn't start with
+    /// `recordType()`.
+    public func primaryKey<M: SwiftProtobuf.Message>(for type: M.Type, id: Tuple) throws -> Tuple {
+        guard let recordType = metaData.recordType(for: M.self) else {
+            throw RecordStoreError.unknownRecordType(M.protoMessageName)
+        }
+        guard recordType.primaryKeyStartsWithRecordType else {
+            throw RecordStoreError.primaryKeyNotTypePrefixed(M.protoMessageName)
+        }
+        return Tuple(recordType.recordTypePrefix + id.elements)
+    }
+
+    /// The record type key of `M` (Java's `RecordType.getRecordTypeKey()`), e.g. to build a
+    /// type-prefixed primary key by hand.
+    public func recordTypeKey<M: SwiftProtobuf.Message>(for type: M.Type) throws -> Int64 {
+        guard let recordType = metaData.recordType(for: M.self) else {
+            throw RecordStoreError.unknownRecordType(M.protoMessageName)
+        }
+        return recordType.recordTypeKey
+    }
+
+    /// Loads the record of type `M` with the given (full) primary key, or `nil` if none exists —
+    /// Java's `loadRecord`. Throws ``RecordStoreError/recordTypeMismatch(expected:found:)`` if the
+    /// key holds a record of another type. For a type whose primary key starts with
+    /// ``KeyExpression/recordType()``, ``load(_:id:)`` adds the type key for you.
     public func load<M: SwiftProtobuf.Message & Sendable>(
         _ type: M.Type, primaryKey: Tuple
     ) async throws -> FDBStoredRecord<M>? {
@@ -849,16 +876,50 @@ public final class FDBRecordStore: Sendable {
         try await load(type, primaryKey: Tuple(primaryKey))
     }
 
-    /// Deletes the record of type `M` with the given primary key and its index entries.
-    /// Returns `true` if a record was deleted.
+    /// Loads a record of a type whose primary key starts with ``KeyExpression/recordType()``,
+    /// by the rest of its primary key: `load(Account.self, id: 42)` loads `(typeKey, 42)`.
+    /// Throws ``RecordStoreError/primaryKeyNotTypePrefixed(_:)`` for other types.
+    public func load<M: SwiftProtobuf.Message & Sendable>(
+        _ type: M.Type, id: any TupleElement...
+    ) async throws -> FDBStoredRecord<M>? {
+        try await load(type, primaryKey: primaryKey(for: type, id: Tuple(id)))
+    }
+
+    /// Deletes the record of type `M` with the given (full) primary key and its index entries.
+    /// Returns `true` if a record was deleted. Unlike Java's untyped `deleteRecord` (see
+    /// ``deleteRecord(primaryKey:)``), this throws
+    /// ``RecordStoreError/recordTypeMismatch(expected:found:)`` rather than delete a record of
+    /// another type stored under the key.
     @discardableResult
     public func delete<M: SwiftProtobuf.Message & Sendable>(
         _ type: M.Type, primaryKey: Tuple
     ) async throws -> Bool {
-        guard metaData.recordType(for: M.self) != nil else {
+        guard let recordType = metaData.recordType(for: M.self) else {
             throw RecordStoreError.unknownRecordType(M.protoMessageName)
         }
+        if let existing = try await loadExisting(primaryKey),
+           existing.indexable.recordType.recordName != recordType.recordName {
+            throw RecordStoreError.recordTypeMismatch(
+                expected: recordType.recordName, found: existing.indexable.recordType.recordName)
+        }
         return try await deleteRecord(primaryKey: primaryKey)
+    }
+
+    /// Convenience: delete by primary-key elements, e.g. `delete(Order.self, 42)`.
+    @discardableResult
+    public func delete<M: SwiftProtobuf.Message & Sendable>(
+        _ type: M.Type, _ primaryKey: any TupleElement...
+    ) async throws -> Bool {
+        try await delete(type, primaryKey: Tuple(primaryKey))
+    }
+
+    /// Deletes a record of a type whose primary key starts with ``KeyExpression/recordType()``,
+    /// by the rest of its primary key (see ``load(_:id:)``).
+    @discardableResult
+    public func delete<M: SwiftProtobuf.Message & Sendable>(
+        _ type: M.Type, id: any TupleElement...
+    ) async throws -> Bool {
+        try await delete(type, primaryKey: primaryKey(for: type, id: Tuple(id)))
     }
 
     /// Deletes whatever record is stored under `primaryKey` (Java's untyped `deleteRecord`).
