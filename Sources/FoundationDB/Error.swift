@@ -29,7 +29,7 @@ enum FDBErrorCode: Int32, CaseIterable {
     case transactionCancelled = 1025
     case transactionTimedOut = 1031
     case processBehind = 1037
-    case commitReadIncomplete = 1039
+    case clusterVersionChanged = 1039
     case tagThrottled = 1213
     case internalError = 2000
     case transactionTooLarge = 2101
@@ -77,6 +77,13 @@ public struct FDBError: Error, CustomStringConvertible {
         case FDBErrorCode.transactionCancelled.rawValue:
             return false
         case FDBErrorCode.transactionTimedOut.rawValue:
+            // The caller's own timeout, which can fire mid-commit, leaving the outcome unknown. FoundationDB's
+            // `fdb_transaction_on_error` doesn't retry it, and https://apple.github.io/foundationdb/automatic-idempotency.html
+            // recommends never retrying it.
+            return false
+        case FDBErrorCode.clusterVersionChanged.rawValue:
+            // The multi-version client switched cluster versions: like `commit_unknown_result`, the commit may
+            // have happened (or still happen). Retryable, so transactions must be idempotent.
             return true
         case FDBErrorCode.processBehind.rawValue:
             return true

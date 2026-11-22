@@ -905,7 +905,10 @@ func fdbErrorRetryable() {
     #expect(futureVersionError.isRetryable, "future_version should be retryable")
 
     let transactionTimedOutError = FDBError(.transactionTimedOut)
-    #expect(transactionTimedOutError.isRetryable, "transaction_timed_out should be retryable")
+    #expect(!transactionTimedOutError.isRetryable, "transaction_timed_out may have committed: never retried")
+
+    let clusterVersionChangedError = FDBError(.clusterVersionChanged)
+    #expect(clusterVersionChangedError.isRetryable, "cluster_version_changed should be retryable")
 
     let processBehindError = FDBError(.processBehind)
     #expect(processBehindError.isRetryable, "process_behind should be retryable")

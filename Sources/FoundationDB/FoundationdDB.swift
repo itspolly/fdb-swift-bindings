@@ -297,7 +297,14 @@ extension DatabaseProtocol {
     }
 }
 
-/// Runs `operation` in a transaction with automatic retry on retryable errors.
+/// Runs `operation` in a transaction, retrying the way FoundationDB's own retry loop does.
+///
+/// Each failure goes to `fdb_transaction_on_error`, which decides: for a retryable error it backs off,
+/// resets the transaction and the loop runs `operation` again; for any other error it throws, and so does
+/// this. FoundationDB retries conflicts, and also `commit_unknown_result` and (under the multi-version
+/// client) `cluster_version_changed`, after which the earlier attempt may have committed: `operation` must
+/// be idempotent. It doesn't retry `transaction_timed_out`. Errors that aren't `FDBError`s are thrown
+/// without retrying.
 ///
 /// Shared by ``DatabaseProtocol/withTransaction(_:)`` and ``FDBTenant/withTransaction(_:)`` so
 /// database- and tenant-scoped transactions use identical retry semantics.
@@ -305,28 +312,20 @@ func runTransaction<T: Sendable>(
     creating createTransaction: () throws -> any TransactionProtocol,
     _ operation: (TransactionProtocol) async throws -> T
 ) async throws -> T {
-    let maxRetries = 100 // TODO: Remove this.
+    let maxRetries = 100
+    let transaction = try createTransaction()
 
-    for attempt in 0 ..< maxRetries {
-        let transaction = try createTransaction()
-
+    for _ in 0 ..< maxRetries {
         do {
             let result = try await operation(transaction)
-            let committed = try await transaction.commit()
-
-            if committed {
+            if try await transaction.commit() {
                 return result
             }
+        } catch let error as FDBError {
+            // Throws the error back unless it's retryable; otherwise backs off and resets the transaction.
+            try await transaction.onError(error)
         } catch {
-            // TODO: If user wants to cancel, don't retry.
             transaction.cancel()
-
-            if let fdbError = error as? FDBError, fdbError.isRetryable {
-                if attempt < maxRetries - 1 {
-                    continue
-                }
-            }
-
             throw error
         }
     }
